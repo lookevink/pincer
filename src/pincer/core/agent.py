@@ -41,6 +41,7 @@ from pincer.memory.base import (
     PINCER_MEMORY_ASSISTANT_RESPONSE_PREFIX,
     PINCER_MEMORY_USER_REQUEST_PREFIX,
 )
+from pincer.tools.path_sandbox import SandboxDenied
 
 # Signature: (tool_name, arguments, user_id, channel) -> approved?
 ApprovalCallback = Callable[[str, dict[str, Any], str, str], Awaitable[bool]]
@@ -1387,6 +1388,13 @@ class Agent:
                 return ToolResult(
                     tool_call_id=tool_call.id,
                     content=f"Error: Tool '{tool_call.name}' not found.",
+                    is_error=True,
+                )
+            except SandboxDenied as e:
+                logger.warning("Tool '%s' denied: %s", tool_call.name, e)
+                return ToolResult(
+                    tool_call_id=tool_call.id,
+                    content=f"Error executing {tool_call.name}: {e}",
                     is_error=True,
                 )
             except Exception as e:

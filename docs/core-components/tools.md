@@ -53,6 +53,8 @@ Registered in `src/pincer/cli/run.py::_run_agent()`. These are always available.
 | `load_skill_reference` | No | Read a file referenced by a skill, by relative path |
 | `run_skill_script` | **Yes** | Run a script bundled with a skill in a sandboxed subprocess |
 
+> `file_read`/`file_write`/`file_list` are hard-confined to `~/.pincer/workspace` via `confine_path()` (`src/pincer/tools/path_sandbox.py`) — there is no configuration escape hatch. `shell_exec`'s "sandboxed subprocess" above refers to resource limits and a denylist of destructive patterns (`is_blocked()` in `src/pincer/tools/builtin/shell.py`); it has **no path confinement**, so once approved, a shell command can read/write anywhere the process user can — including paths `file_read` would refuse. See [Security Model](security-model.md) for details.
+
 ---
 
 ## Bundled skills (5)

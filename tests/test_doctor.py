@@ -833,6 +833,15 @@ def test_tool_approval_mode_warning_on_never_overrides():
     result = doc._check_tool_approval_mode(_approval_cfg("critical", "email_send"))
     assert result.status == CheckStatus.WARNING
     assert "email_send" in result.message
+    assert "file sandbox" not in result.message
+
+
+def test_tool_approval_mode_warning_shell_exec_bypasses_sandbox():
+    doc = SecurityDoctor()
+    result = doc._check_tool_approval_mode(_approval_cfg("critical", "shell_exec"))
+    assert result.status == CheckStatus.WARNING
+    assert "shell_exec" in result.message
+    assert "file_read/file_write workspace sandbox" in result.message
 
 
 # ── Voice checks ──────────────────────────────────────────────────────────────

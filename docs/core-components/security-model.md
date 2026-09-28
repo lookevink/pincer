@@ -68,6 +68,8 @@ Tools are classified at registration time:
 | **Moderate** | gmail_send, calendar_create | Configurable |
 | **Dangerous** | shell_exec, file_write, python_exec | Always |
 
+`file_read`/`file_write`/`file_list` and `shell_exec` are **not equivalently sandboxed**, despite both appearing "dangerous"/gated above: the file tools are hard-confined to `~/.pincer/workspace` (`confine_path()` in `src/pincer/tools/path_sandbox.py`, no config escape hatch), while `shell_exec` has no path confinement at all — only a denylist of destructive command patterns plus approval. Once a `shell_exec` call is approved, it can read/write any path the process user can reach, including ones `file_read` would refuse. See [Tools Catalog](tools.md) for the full breakdown.
+
 You can override the approval policy per tool in your config:
 
 ```env

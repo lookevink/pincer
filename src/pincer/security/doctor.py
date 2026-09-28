@@ -2136,6 +2136,17 @@ class SecurityDoctor:
                 category="runtime",
             )
         if mode == "critical" and never:
+            if "shell_exec" in never:
+                return CheckResult(
+                    "tool_approval_mode",
+                    CheckStatus.WARNING,
+                    "Tool approval: critical, with shell_exec force-ungated via PINCER_APPROVAL_NEVER — "
+                    "this bypasses the file_read/file_write workspace sandbox entirely "
+                    "(shell has no path confinement)",
+                    fix_hint="Remove shell_exec from PINCER_APPROVAL_NEVER, or accept that it can read/write "
+                    "anywhere the process user can, unlike file_read/file_write",
+                    category="runtime",
+                )
             return CheckResult(
                 "tool_approval_mode",
                 CheckStatus.WARNING,
