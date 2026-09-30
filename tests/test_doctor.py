@@ -833,7 +833,7 @@ def test_tool_approval_mode_warning_on_never_overrides():
     result = doc._check_tool_approval_mode(_approval_cfg("critical", "email_send"))
     assert result.status == CheckStatus.WARNING
     assert "email_send" in result.message
-    assert "file sandbox" not in result.message
+    assert "path confinement" not in result.message
 
 
 def test_tool_approval_mode_warning_shell_exec_bypasses_sandbox():
