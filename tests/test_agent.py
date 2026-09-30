@@ -1,6 +1,7 @@
 """Tests for the ReAct agent loop."""
 
 import logging
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
 import pytest
@@ -8,7 +9,7 @@ import pytest
 from pincer.core.agent import Agent, AgentResponse
 from pincer.exceptions import BudgetExceededError, LLMError
 from pincer.llm.base import LLMResponse, ToolCall
-from pincer.tools.path_sandbox import SandboxDenied
+from pincer.tools.builtin import files
 from pincer.tools.registry import ToolRegistry
 
 
@@ -380,18 +381,18 @@ async def test_run_headless_exhausts_iterations_returns_last_response(
 
 @pytest.mark.asyncio
 async def test_execute_tool_sandbox_denied_logs_warning_not_error(
-    settings, mock_llm, session_manager, cost_tracker, caplog
+    settings, mock_llm, session_manager, cost_tracker, caplog, tmp_path, monkeypatch
 ):
-    """A SandboxDenied (issue #218) is expected policy, not a crash — no ERROR, no traceback."""
+    """An out-of-workspace file_read (issue #218) is expected policy, not a crash — no ERROR, no traceback.
+
+    Uses the real file_read so the whole file_read → _sandbox_path → confine_path chain is exercised.
+    """
+    monkeypatch.setattr(files, "get_settings", lambda: SimpleNamespace(data_dir=tmp_path))
     registry = ToolRegistry()
-
-    async def file_read(path: str) -> str:
-        raise SandboxDenied(f"Access denied: path '{path}' is outside workspace. All file operations are sandboxed.")
-
     registry.register(
         name="file_read",
         description="Read a file",
-        handler=file_read,
+        handler=files.file_read,
         parameters={"type": "object", "properties": {"path": {"type": "string"}}},
     )
     agent = Agent(settings, mock_llm, session_manager, cost_tracker, registry)
@@ -402,6 +403,7 @@ async def test_execute_tool_sandbox_denied_logs_warning_not_error(
 
     assert result.is_error is True
     assert "outside workspace" in result.content
+    assert "All file operations are sandboxed." in result.content
 
     error_records = [r for r in caplog.records if r.levelno >= logging.ERROR]
     assert error_records == []
