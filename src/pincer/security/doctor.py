@@ -2140,10 +2140,13 @@ class SecurityDoctor:
         if never:
             msg = f"Tool approval: {mode}, with {len(never)} tool(s) force-ungated: {', '.join(never[:5])}"
             fix_hint = "Review PINCER_APPROVAL_NEVER — entries there bypass the approval policy"
-            if "shell_exec" in never:
-                msg += " — shell_exec has no path confinement (bypasses the file_read/file_write workspace sandbox)"
+            unconfined = [t for t in ("python_exec", "shell_exec") if t in never]
+            if unconfined:
+                names = " and ".join(unconfined)
+                msg += f" — {names} {'have' if len(unconfined) > 1 else 'has'} no path confinement "
+                msg += "(bypasses the file_read/file_write workspace sandbox)"
                 fix_hint += (
-                    "; remove shell_exec, or accept that it can read/write anywhere the "
+                    f"; remove {names}, or accept that they can read/write anywhere the "
                     "process user can, unlike file_read/file_write"
                 )
             return CheckResult(

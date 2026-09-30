@@ -844,6 +844,21 @@ def test_tool_approval_mode_warning_shell_exec_bypasses_sandbox():
     assert "file_read/file_write workspace sandbox" in result.message
 
 
+def test_tool_approval_mode_warning_python_exec_bypasses_sandbox():
+    doc = SecurityDoctor()
+    result = doc._check_tool_approval_mode(_approval_cfg("critical", "python_exec"))
+    assert result.status == CheckStatus.WARNING
+    assert "python_exec has no path confinement" in result.message
+    assert "file_read/file_write workspace sandbox" in result.message
+
+
+def test_tool_approval_mode_warning_names_both_unconfined_tools():
+    doc = SecurityDoctor()
+    result = doc._check_tool_approval_mode(_approval_cfg("critical", "shell_exec,python_exec"))
+    assert result.status == CheckStatus.WARNING
+    assert "python_exec and shell_exec have no path confinement" in result.message
+
+
 def test_tool_approval_mode_warning_on_never_under_all():
     """``never`` wins over mode "all" too, so it must not report PASS."""
     doc = SecurityDoctor()

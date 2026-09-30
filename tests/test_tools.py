@@ -67,6 +67,13 @@ class TestScheduleToolRegistration:
     assert is_blocked("git status") is None
 
 
+def test_python_exec_requires_approval(settings) -> None:
+    """python_exec runs arbitrary code with no path confinement, so it must be gated like shell_exec."""
+    registry = ToolRegistry()
+    register_default_tools(registry, settings)
+    assert registry.declares_approval("python_exec") is True
+
+
 def test_sandbox_path_blocks_escape(tmp_path: Path, settings) -> None:
     os.environ["PINCER_DATA_DIR"] = str(tmp_path)
     from pincer.config import get_settings

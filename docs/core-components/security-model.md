@@ -72,13 +72,12 @@ Tools are classified at registration time:
 
 `file_read`, `file_write` and `file_list` can only reach `<data_dir>/workspace` (`PINCER_DATA_DIR`, default `~/.pincer`, so `~/.pincer/workspace`). This is deliberate: there is no allowlist of extra read roots, and moving the workspace means moving `PINCER_DATA_DIR`. Every path is resolved (including `..` and symlinks) and checked by `confine_path()` in `src/pincer/tools/path_sandbox.py`. A path outside the workspace raises `SandboxDenied`, which the agent logs as a single WARNING line and returns to the model as a denial message rather than treating it as a tool failure.
 
-`shell_exec` does **not** follow this policy. It runs a plain subprocess (`src/pincer/tools/builtin/shell.py`) guarded only by:
+`shell_exec` and `python_exec` do **not** follow this policy. Both run a plain subprocess with no path confinement and no resource limits (the rlimits in Layer 3 apply to `run_skill_script` only):
 
-- a denylist of destructive command patterns (`is_blocked()`),
-- a timeout (`PINCER_SHELL_TIMEOUT`) and output truncation,
-- approval — it is critical under `PINCER_APPROVAL_POLICY=critical`.
+- `shell_exec` (`src/pincer/tools/builtin/shell.py`) — a denylist of destructive command patterns (`is_blocked()`), a timeout (`PINCER_SHELL_TIMEOUT`), output truncation and approval.
+- `python_exec` (`src/pincer/tools/builtin/python_exec.py`) — a timeout (max 120s), output truncation and approval. There is no denylist, and the subprocess inherits the agent's environment (minus AWS credentials).
 
-It has no path confinement and no resource limits (the rlimits in Layer 3 apply to `run_skill_script` only). Once a `shell_exec` call is approved, it can read and write anywhere the process user can, including paths `file_read` refuses, so approving a shell command amounts to granting access outside the workspace. Listing `shell_exec` in `PINCER_APPROVAL_NEVER` removes that last gate; `pincer doctor` warns when it is set.
+Once approved, either tool can read and write anywhere the process user can, including paths `file_read` refuses, so approving one amounts to granting access outside the workspace. Listing either in `PINCER_APPROVAL_NEVER` removes that last gate; `pincer doctor` warns when it is set.
 
 You can override the approval policy per tool in your config:
 
