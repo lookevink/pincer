@@ -35,7 +35,6 @@ def test_sandbox_path_raises_sandbox_denied_with_hint(tmp_path: Path, monkeypatc
     assert "All file operations are sandboxed." in str(excinfo.value)
 
 
-@pytest.mark.asyncio
 async def test_file_read_outside_workspace_raises_sandbox_denied(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
