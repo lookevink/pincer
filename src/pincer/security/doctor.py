@@ -2135,23 +2135,22 @@ class SecurityDoctor:
                 fix_hint="Set PINCER_APPROVAL_POLICY=critical unless this is a trusted non-interactive deployment",
                 category="runtime",
             )
-        if mode == "critical" and never:
+        # ``never`` wins over every mode in ApprovalPolicy.requires_approval,
+        # so it ungates tools under "all" just as it does under "critical".
+        if never:
+            msg = f"Tool approval: {mode}, with {len(never)} tool(s) force-ungated: {', '.join(never[:5])}"
+            fix_hint = "Review PINCER_APPROVAL_NEVER — entries there bypass the approval policy"
             if "shell_exec" in never:
-                return CheckResult(
-                    "tool_approval_mode",
-                    CheckStatus.WARNING,
-                    "Tool approval: critical, with shell_exec force-ungated via PINCER_APPROVAL_NEVER — "
-                    "this bypasses the file_read/file_write workspace sandbox entirely "
-                    "(shell has no path confinement)",
-                    fix_hint="Remove shell_exec from PINCER_APPROVAL_NEVER, or accept that it can read/write "
-                    "anywhere the process user can, unlike file_read/file_write",
-                    category="runtime",
+                msg += " — shell_exec has no path confinement (bypasses the file_read/file_write workspace sandbox)"
+                fix_hint += (
+                    "; remove shell_exec, or accept that it can read/write anywhere the "
+                    "process user can, unlike file_read/file_write"
                 )
             return CheckResult(
                 "tool_approval_mode",
                 CheckStatus.WARNING,
-                f"Tool approval: critical, with {len(never)} tool(s) force-ungated: {', '.join(sorted(never)[:5])}",
-                fix_hint="Review PINCER_APPROVAL_NEVER — entries there bypass the critical classification",
+                msg,
+                fix_hint=fix_hint,
                 category="runtime",
             )
         return CheckResult(
