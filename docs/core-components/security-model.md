@@ -68,7 +68,17 @@ Tools are classified at registration time:
 | **Moderate** | gmail_send, calendar_create | Configurable |
 | **Dangerous** | shell_exec, file_write, python_exec | Always |
 
-`file_read`/`file_write`/`file_list` and `shell_exec` are **not equivalently sandboxed**, despite both appearing "dangerous"/gated above: the file tools are hard-confined to `~/.pincer/workspace` (`confine_path()` in `src/pincer/tools/path_sandbox.py`, no config escape hatch), while `shell_exec` has no path confinement at all — only a denylist of destructive command patterns plus approval. Once a `shell_exec` call is approved, it can read/write any path the process user can reach, including ones `file_read` would refuse. See [Tools Catalog](tools.md) for the full breakdown.
+#### File access policy: workspace-only, by design
+
+`file_read`, `file_write` and `file_list` can only reach `<data_dir>/workspace` (`PINCER_DATA_DIR`, default `~/.pincer`, so `~/.pincer/workspace`). This is deliberate: there is no allowlist of extra read roots, and moving the workspace means moving `PINCER_DATA_DIR`. Every path is resolved (including `..` and symlinks) and checked by `confine_path()` in `src/pincer/tools/path_sandbox.py`. A path outside the workspace raises `SandboxDenied`, which the agent logs as a single WARNING line and returns to the model as a denial message rather than treating it as a tool failure.
+
+`shell_exec` does **not** follow this policy. It runs a plain subprocess (`src/pincer/tools/builtin/shell.py`) guarded only by:
+
+- a denylist of destructive command patterns (`is_blocked()`),
+- a timeout (`PINCER_SHELL_TIMEOUT`) and output truncation,
+- approval — it is critical under `PINCER_APPROVAL_POLICY=critical`.
+
+It has no path confinement and no resource limits (the rlimits in Layer 3 apply to `run_skill_script` only). Once a `shell_exec` call is approved, it can read and write anywhere the process user can, including paths `file_read` refuses, so approving a shell command amounts to granting access outside the workspace. Listing `shell_exec` in `PINCER_APPROVAL_NEVER` removes that last gate; `pincer doctor` warns when it is set.
 
 You can override the approval policy per tool in your config:
 
