@@ -834,6 +834,48 @@ def test_tool_approval_mode_warning_on_never_overrides():
     result = doc._check_tool_approval_mode(_approval_cfg("critical", "email_send"))
     assert result.status == CheckStatus.WARNING
     assert "email_send" in result.message
+    assert "path confinement" not in result.message
+
+
+def test_tool_approval_mode_warning_shell_exec_bypasses_sandbox():
+    doc = SecurityDoctor()
+    result = doc._check_tool_approval_mode(_approval_cfg("critical", "shell_exec"))
+    assert result.status == CheckStatus.WARNING
+    assert "shell_exec" in result.message
+    assert "file_read/file_write workspace sandbox" in result.message
+
+
+def test_tool_approval_mode_warning_python_exec_bypasses_sandbox():
+    doc = SecurityDoctor()
+    result = doc._check_tool_approval_mode(_approval_cfg("critical", "python_exec"))
+    assert result.status == CheckStatus.WARNING
+    assert "python_exec has no path confinement" in result.message
+    assert "file_read/file_write workspace sandbox" in result.message
+
+
+def test_tool_approval_mode_warning_names_both_unconfined_tools():
+    doc = SecurityDoctor()
+    result = doc._check_tool_approval_mode(_approval_cfg("critical", "shell_exec,python_exec"))
+    assert result.status == CheckStatus.WARNING
+    assert "python_exec and shell_exec have no path confinement" in result.message
+
+
+def test_tool_approval_mode_warning_on_never_under_all():
+    """``never`` wins over mode "all" too, so it must not report PASS."""
+    doc = SecurityDoctor()
+    result = doc._check_tool_approval_mode(_approval_cfg("all", "shell_exec"))
+    assert result.status == CheckStatus.WARNING
+    assert "Tool approval: all" in result.message
+    assert "file_read/file_write workspace sandbox" in result.message
+
+
+def test_tool_approval_mode_shell_exec_note_keeps_other_never_entries():
+    doc = SecurityDoctor()
+    result = doc._check_tool_approval_mode(_approval_cfg("critical", "shell_exec,email_send"))
+    assert result.status == CheckStatus.WARNING
+    assert "email_send" in result.message
+    assert "shell_exec" in result.message
+    assert "file_read/file_write workspace sandbox" in result.message
 
 
 # ── Voice checks ──────────────────────────────────────────────────────────────

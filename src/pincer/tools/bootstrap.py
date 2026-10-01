@@ -164,6 +164,7 @@ def _register_builtins(tools: ToolRegistry, settings: Settings, report: dict[str
             },
             "required": ["code"],
         },
+        require_approval=True,
     )
     report["builtins"] += 1
 

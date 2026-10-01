@@ -5,8 +5,12 @@ from __future__ import annotations
 from pathlib import Path
 
 
+class SandboxDenied(ValueError):
+    """A path resolved outside the confined base directory — expected policy, not a bug."""
+
+
 def confine_path(base: Path, requested: str, label: str = "directory") -> Path:
-    """Resolve `requested` within `base`. Raises ValueError if it would escape."""
+    """Resolve `requested` within `base`. Raises SandboxDenied if it would escape."""
     base_resolved = base.resolve()
 
     if requested.startswith("~"):
@@ -16,5 +20,5 @@ def confine_path(base: Path, requested: str, label: str = "directory") -> Path:
     target = raw.resolve() if raw.is_absolute() else (base_resolved / requested).resolve()
 
     if target != base_resolved and not str(target).startswith(str(base_resolved) + "/"):
-        raise ValueError(f"Access denied: path '{requested}' is outside {label} ({base_resolved}).")
+        raise SandboxDenied(f"Access denied: path '{requested}' is outside {label} ({base_resolved}).")
     return target

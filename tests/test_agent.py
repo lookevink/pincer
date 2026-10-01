@@ -1,5 +1,7 @@
 """Tests for the ReAct agent loop."""
 
+import logging
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
 import pytest
@@ -7,6 +9,7 @@ import pytest
 from pincer.core.agent import Agent, AgentResponse
 from pincer.exceptions import BudgetExceededError, LLMError
 from pincer.llm.base import LLMResponse, ToolCall
+from pincer.tools.builtin import files
 from pincer.tools.registry import ToolRegistry
 
 
@@ -374,3 +377,67 @@ async def test_run_headless_exhausts_iterations_returns_last_response(
 
     assert result == "partial thoughts"
     assert mock_llm.complete.call_count == 1
+
+
+@pytest.mark.asyncio
+async def test_execute_tool_sandbox_denied_logs_warning_not_error(
+    settings, mock_llm, session_manager, cost_tracker, caplog, tmp_path, monkeypatch
+):
+    """An out-of-workspace file_read (issue #218) is expected policy, not a crash — no ERROR, no traceback.
+
+    Uses the real file_read so the whole file_read → _sandbox_path → confine_path chain is exercised.
+    """
+    monkeypatch.setattr(files, "get_settings", lambda: SimpleNamespace(data_dir=tmp_path))
+    registry = ToolRegistry()
+    registry.register(
+        name="file_read",
+        description="Read a file",
+        handler=files.file_read,
+        parameters={"type": "object", "properties": {"path": {"type": "string"}}},
+    )
+    agent = Agent(settings, mock_llm, session_manager, cost_tracker, registry)
+    tool_call = ToolCall(id="tc1", name="file_read", arguments={"path": "/etc/passwd"})
+
+    with caplog.at_level(logging.INFO):
+        result = await agent._execute_tool(tool_call, "user1", "test")
+
+    assert result.is_error is True
+    assert "outside workspace" in result.content
+    assert "All file operations are sandboxed." in result.content
+
+    error_records = [r for r in caplog.records if r.levelno >= logging.ERROR]
+    assert error_records == []
+
+    warning_records = [r for r in caplog.records if r.levelno == logging.WARNING]
+    assert len(warning_records) == 1
+    assert warning_records[0].exc_info is None
+
+
+@pytest.mark.asyncio
+async def test_execute_tool_genuine_error_still_logs_error_with_traceback(
+    settings, mock_llm, session_manager, cost_tracker, caplog
+):
+    """Non-sandbox tool failures are unaffected — still ERROR level, with a traceback."""
+    registry = ToolRegistry()
+
+    async def boom() -> str:
+        raise RuntimeError("something actually broke")
+
+    registry.register(
+        name="boom",
+        description="Always fails",
+        handler=boom,
+        parameters={"type": "object", "properties": {}},
+    )
+    agent = Agent(settings, mock_llm, session_manager, cost_tracker, registry)
+    tool_call = ToolCall(id="tc1", name="boom", arguments={})
+
+    with caplog.at_level(logging.INFO):
+        result = await agent._execute_tool(tool_call, "user1", "test")
+
+    assert result.is_error is True
+    assert "RuntimeError" in result.content
+
+    error_records = [r for r in caplog.records if r.levelno >= logging.ERROR]
+    assert len(error_records) == 1
+    assert error_records[0].exc_info is not None

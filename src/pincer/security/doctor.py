@@ -2223,12 +2223,25 @@ class SecurityDoctor:
                 fix_hint="Set PINCER_APPROVAL_POLICY=critical unless this is a trusted non-interactive deployment",
                 category="runtime",
             )
-        if mode == "critical" and never:
+        # ``never`` wins over every mode in ApprovalPolicy.requires_approval,
+        # so it ungates tools under "all" just as it does under "critical".
+        if never:
+            msg = f"Tool approval: {mode}, with {len(never)} tool(s) force-ungated: {', '.join(never[:5])}"
+            fix_hint = "Review PINCER_APPROVAL_NEVER — entries there bypass the approval policy"
+            unconfined = [t for t in ("python_exec", "shell_exec") if t in never]
+            if unconfined:
+                names = " and ".join(unconfined)
+                msg += f" — {names} {'have' if len(unconfined) > 1 else 'has'} no path confinement "
+                msg += "(bypasses the file_read/file_write workspace sandbox)"
+                fix_hint += (
+                    f"; remove {names}, or accept that they can read/write anywhere the "
+                    "process user can, unlike file_read/file_write"
+                )
             return CheckResult(
                 "tool_approval_mode",
                 CheckStatus.WARNING,
-                f"Tool approval: critical, with {len(never)} tool(s) force-ungated: {', '.join(sorted(never)[:5])}",
-                fix_hint="Review PINCER_APPROVAL_NEVER — entries there bypass the critical classification",
+                msg,
+                fix_hint=fix_hint,
                 category="runtime",
             )
         return CheckResult(

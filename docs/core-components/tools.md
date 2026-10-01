@@ -26,8 +26,8 @@ Registered in `src/pincer/cli/run.py::_run_agent()`. These are always available.
 
 | Tool | Approval | Description |
 |---|:---:|---|
-| `shell_exec` | **Yes** | Run shell commands in a sandboxed subprocess |
-| `python_exec` | **Yes** | Execute Python code in an isolated sandbox |
+| `shell_exec` | **Yes** | Run shell commands in a subprocess (denylist + timeout, no path confinement) |
+| `python_exec` | **Yes** | Execute Python code in a subprocess (timeout, no path confinement) |
 | `file_read` | No | Read a file from the workspace |
 | `file_write` | **Yes** | Write content to a file in the workspace |
 | `file_list` | No | List files in a workspace directory |
@@ -52,6 +52,8 @@ Registered in `src/pincer/cli/run.py::_run_agent()`. These are always available.
 | `load_skill` | No | Load a skill's full instructions by name |
 | `load_skill_reference` | No | Read a file referenced by a skill, by relative path |
 | `run_skill_script` | **Yes** | Run a script bundled with a skill in a sandboxed subprocess |
+
+> File tools are confined to `<data_dir>/workspace` (default `~/.pincer/workspace`) by design, with no allowlist. `shell_exec` and `python_exec` have no path confinement (only approval and a timeout, plus a command denylist for `shell_exec`). See [Security Model](security-model.md#file-access-policy-workspace-only-by-design).
 
 ---
 

@@ -5,7 +5,7 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 
 from pincer.config import get_settings
-from pincer.tools.path_sandbox import confine_path
+from pincer.tools.path_sandbox import SandboxDenied, confine_path
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -14,15 +14,15 @@ MAX_READ_SIZE = 100_000  # 100KB
 
 
 def _sandbox_path(path_str: str) -> Path:
-    """Resolve path within sandbox. Raises ValueError if escape attempted."""
+    """Resolve path within sandbox. Raises SandboxDenied if escape attempted."""
     settings = get_settings()
     workspace = settings.data_dir / "workspace"
     workspace.mkdir(exist_ok=True)
 
     try:
         return confine_path(workspace, path_str, label="workspace")
-    except ValueError as e:
-        raise ValueError(f"{e} All file operations are sandboxed.") from e
+    except SandboxDenied as e:
+        raise SandboxDenied(f"{e} All file operations are sandboxed.") from e
 
 
 async def file_read(path: str) -> str:
