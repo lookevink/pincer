@@ -24,6 +24,23 @@ from pincer.tasks.context import get_deliverer, get_proactive, get_triggers
 
 logger = logging.getLogger(__name__)
 
+# Keep in sync with the `handlers` dict built in `run_scheduled_action` below —
+# this is that dict's key set, available without constructing the handlers
+# themselves (each of which needs `settings`). `pincer doctor` imports this to
+# flag schedules whose action type will hit the no-handler branch.
+KNOWN_SCHEDULE_ACTION_TYPES = frozenset(
+    {
+        "briefing",
+        "custom",
+        "retention_purge",
+        "ops_alert_scan",
+        "voice_canary",
+        "voice_weekly_digest",
+        "thread_autoclose",
+        "voice_call",
+    }
+)
+
 
 # Retries wrap the entire handler call below, not just a narrow I/O call — a
 # transient failure after a handler's side effect (e.g. sending a briefing)
@@ -94,7 +111,45 @@ async def run_scheduled_action(schedule_id: str | int) -> None:
     }
     handler = handlers.get(action_type)
     if handler is None:
-        logger.warning("No handler for action type: %s (schedule_id=%s)", action_type, schedule_id)
+        logger.warning(
+            "No handler for action type: %s (schedule_id=%s) — disabling schedule to stop repeated no-op runs",
+            action_type,
+            schedule_id,
+        )
+        disabled = await store.toggle(schedule_id, False, schedule.pincer_user_id)
+        if not disabled:
+            logger.error(
+                "Could not disable schedule with unknown action type: schedule_id=%s name=%s type=%s",
+                schedule_id,
+                schedule.name,
+                action_type,
+            )
+            return
+        # The disable is permanent, and a worker older than the API that
+        # created the schedule (or than the release that added the action
+        # type) lands here for a perfectly valid schedule. System schedules
+        # are seeded by name and never re-enabled on upgrade, so tell the
+        # owner rather than let it go dark with only a log line.
+        notice = (
+            f'Your scheduled task "{schedule.name}" was turned off: this Pincer worker has no handler '
+            f'for its "{action_type}" action. If it was created by a newer version of Pincer, '
+            "re-enable it once every worker is upgraded."
+        )
+        try:
+            delivered = await get_deliverer().send_to_user(
+                schedule.pincer_user_id,
+                notice,
+                prefer=ChannelType(schedule.channel),
+            )
+        except Exception:
+            logger.exception("Disabled-schedule notice failed: schedule_id=%s", schedule_id)
+            return
+        if not delivered:
+            logger.error(
+                "Disabled-schedule notice NOT delivered (no reachable channel for user): schedule_id=%s user=%s",
+                schedule_id,
+                schedule.pincer_user_id,
+            )
         return
 
     try:
