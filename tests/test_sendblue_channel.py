@@ -35,7 +35,7 @@ def event(**changes):
 
 
 @pytest.fixture
-async def channel(settings):
+def sendblue_settings(settings):
     settings.sendblue_api_key = SecretStr("test-key")
     settings.sendblue_api_secret = SecretStr("test-secret")
     settings.sendblue_signing_secret = SecretStr(SECRET)
@@ -43,7 +43,12 @@ async def channel(settings):
     settings.sendblue_allow_from = [SENDER]
     # An ephemeral listener is only a test override (production settings require >0).
     settings.sendblue_webhook_port = 0
-    instance = SendblueChannel(settings)
+    return settings
+
+
+@pytest.fixture
+async def channel(sendblue_settings):
+    instance = SendblueChannel(sendblue_settings)
     await instance.start(AsyncMock(return_value=""))
     yield instance
     await instance.stop()
@@ -223,3 +228,222 @@ async def test_failed_handler_is_not_replayed(channel, client):
     assert (await post(client, event())).status == 200
     await channel._queue.join()
     channel._handler.assert_awaited_once()
+
+
+async def test_invalid_allowlist_fails_before_opening_listener(sendblue_settings):
+    sendblue_settings.sendblue_allow_from = ["not-a-phone"]
+    channel = SendblueChannel(sendblue_settings)
+    with pytest.raises(ValueError, match="allowlist entries"):
+        await channel.start(AsyncMock())
+    assert channel._client is None
+    assert channel._runner is None
+    assert channel._worker is None
+
+
+@pytest.mark.parametrize("error", [OSError("port unavailable"), asyncio.CancelledError()])
+async def test_startup_failure_closes_partial_resources(sendblue_settings, monkeypatch, error):
+    channel = SendblueChannel(sendblue_settings)
+    clients = []
+
+    async def fail_start(site):
+        clients.append(channel._client)
+        raise error
+
+    monkeypatch.setattr(web.TCPSite, "start", fail_start)
+    with pytest.raises(type(error)):
+        await channel.start(AsyncMock())
+    assert clients[0].is_closed
+    assert channel._client is None
+    assert channel._runner is None
+    assert channel._worker is None
+    await channel.stop()  # Cleanup remains safe after a failed start.
+
+
+async def test_identity_roster_blocks_allowlisted_guest(channel, client, settings):
+    from pincer.core.identity import IdentityResolver
+
+    known = "+15555550102"
+    identity = IdentityResolver(settings.db_path, f"owner@sendblue:{known}")
+    await identity.ensure_table()
+    router = ChannelRouter(identity)
+    router.register(ChannelType.SENDBLUE, channel)
+    await router.rebuild_identity_map()
+    channel._identity = identity
+    channel._settings.sendblue_allow_from = ["*"]
+    assert (await post(client, event())).status == 200
+    await channel._queue.join()
+    channel._handler.assert_not_called()
+    assert not channel._seen
+    assert (await post(client, event(from_number=known))).status == 200
+    await channel._queue.join()
+    channel._handler.assert_awaited_once()
+    assert channel._handler.call_args.args[0].user_id == known
+
+
+@pytest.mark.parametrize("content", [None, "", " \n\t"])
+async def test_empty_messages_are_not_queued_or_remembered(channel, client, content):
+    assert (await post(client, event(content=content))).status == 200
+    await channel._queue.join()
+    channel._handler.assert_not_called()
+    assert not channel._seen
+
+
+async def test_duplicate_cache_evicts_oldest_and_retains_recent(channel, client):
+    channel._seen.update((f"old-{n}", None) for n in range(4096))
+    assert (await post(client, event())).status == 200
+    await channel._queue.join()
+    assert len(channel._seen) == 4096
+    assert "old-0" not in channel._seen
+    assert (await post(client, event(message_handle="old-4095"))).status == 200
+    await channel._queue.join()
+    channel._handler.assert_awaited_once()
+    assert (await post(client, event(message_handle="old-0"))).status == 200
+    await channel._queue.join()
+    assert channel._handler.await_count == 2
+    assert len(channel._seen) == 4096
+
+
+async def test_worker_drains_uninitialized_handler_and_recovers(channel, client, caplog):
+    channel._handler = None
+    assert (await post(client, event())).status == 200
+    await asyncio.wait_for(channel._queue.join(), 2)
+    assert "fixture-inbound-1; no automatic replay" in caplog.text
+    assert not channel._worker.done()
+    channel._handler = AsyncMock(return_value="")
+    assert (await post(client, event(message_handle="next"))).status == 200
+    await asyncio.wait_for(channel._queue.join(), 2)
+    channel._handler.assert_awaited_once()
+
+
+async def test_send_requires_started_channel(sendblue_settings):
+    with pytest.raises(RuntimeError, match="not started"):
+        await SendblueChannel(sendblue_settings).send(SENDER, "hello")
+
+
+async def test_invalid_recipient_never_calls_provider(channel, monkeypatch):
+    request = AsyncMock()
+    monkeypatch.setattr(channel._client, "post", request)
+    with pytest.raises(ValueError, match="E.164"):
+        await channel.send("not-a-phone", "hello")
+    request.assert_not_called()
+
+
+async def test_unsupported_attachments_never_call_provider(channel, monkeypatch):
+    request = AsyncMock()
+    monkeypatch.setattr(channel._client, "post", request)
+    with pytest.raises(NotImplementedError, match="text only"):
+        await channel.send_file(SENDER, "/unused/file.pdf")
+    with pytest.raises(NotImplementedError, match="text only"):
+        await channel.send_photo_from_bytes(SENDER, b"image")
+    request.assert_not_called()
+
+
+@pytest.mark.parametrize("enabled", [True, False])
+async def test_cli_sendblue_startup_registers_live_reply_and_proactive_routes(
+    sendblue_settings, mock_llm, session_manager, cost_tracker, tool_registry, monkeypatch, enabled
+):
+    """Run real CLI channel wiring; stop before unrelated schedulers/signals start."""
+    import importlib
+    from types import SimpleNamespace
+
+    from pincer.db.engine import dispose_engines
+
+    cli = importlib.import_module("pincer.cli.run")
+    settings = sendblue_settings
+    settings.sendblue_enabled = enabled
+    settings.telegram_bot_token = SecretStr("")
+    settings.discord_bot_token = SecretStr("")
+    settings.slack_bot_token = SecretStr("")
+    settings.teams_app_id = ""
+    settings.whatsapp_enabled = False
+    settings.signal_enabled = False
+    settings.voice_enabled = False
+    settings.voice_outbound_enabled = False
+    settings.identity_map = f"owner@sendblue:{SENDER}"
+    agent = Agent(settings, mock_llm, session_manager, cost_tracker, tool_registry)
+    rate_limiter = AsyncMock()
+    core = SimpleNamespace(
+        session_mgr=session_manager,
+        cost_tracker=cost_tracker,
+        audit_logger=None,
+        rate_limiter=rate_limiter,
+        llm=mock_llm,
+        memory_store=None,
+        tools=tool_registry,
+        mcp_manager=None,
+        agent=agent,
+    )
+    monkeypatch.setattr(cli, "_build_core", AsyncMock(return_value=core))
+    monkeypatch.setattr(cli, "_port_in_use", lambda *_: False)
+    maps = []
+    register_tools = cli._register_channel_bound_tools
+
+    def capture_channel_map(tools, channel_map):
+        maps.append(channel_map)
+        register_tools(tools, channel_map)
+
+    monkeypatch.setattr(cli, "_register_channel_bound_tools", capture_channel_map)
+    routers = []
+    rebuild = ChannelRouter.rebuild_identity_map
+
+    class ChannelsStarted(Exception):
+        pass
+
+    async def stop_before_scheduler(router):
+        await rebuild(router)
+        routers.append(router)
+        raise ChannelsStarted
+
+    monkeypatch.setattr(ChannelRouter, "rebuild_identity_map", stop_before_scheduler)
+    try:
+        if not enabled:
+            await cli._run_agent(settings)
+            assert maps == [{}]
+            assert not routers
+            mock_llm.complete.assert_not_called()
+            return
+
+        with pytest.raises(ChannelsStarted):
+            await cli._run_agent(settings)
+        channel = maps[0]["sendblue"]
+        router = routers[0]
+        assert router.channels == {ChannelType.SENDBLUE: channel}
+        assert channel._identity is agent.identity_resolver
+        assert channel._worker is not None and not channel._worker.done()
+        received = []
+
+        async def provider(request):
+            assert request.headers["sb-api-key-id"] == "test-key"
+            assert request.headers["sb-api-secret-key"] == "test-secret"
+            received.append(await request.json())
+            return web.json_response({"status": "QUEUED", "message_handle": "cli-reply"})
+
+        app = web.Application()
+        app.router.add_post("/api/send-message", provider)
+        async with TestServer(app) as server:
+            await channel._client.aclose()
+            channel._client = httpx.AsyncClient(
+                base_url=str(server.make_url("/")),
+                headers={"sb-api-key-id": "test-key", "sb-api-secret-key": "test-secret"},
+            )
+            port = channel._runner.addresses[0][1]
+            async with ClientSession(base_url=f"http://127.0.0.1:{port}") as client:
+                assert (await post(client, event())).status == 200
+                await asyncio.wait_for(channel._queue.join(), 10)
+            assert len(received) == 1
+            assert received[0]["number"] == SENDER
+            assert received[0]["from_number"] == LINE
+            assert "Hello! I'm Pincer." in received[0]["content"]
+            canonical = await channel._identity.find(ChannelType.SENDBLUE, SENDER)
+            assert canonical is not None
+            rate_limiter.check_message.assert_awaited_once_with(canonical)
+            session = await session_manager.get_or_create(canonical, "sendblue")
+            assert any(m.content == "Hello!" for m in session.messages)
+            assert any("Hello! I'm Pincer." in m.content for m in session.messages if m.content)
+            assert await router.send(ChannelType.SENDBLUE, SENDER, "CLI reminder")
+            assert received[-1] == {"number": SENDER, "from_number": LINE, "content": "CLI reminder"}
+    finally:
+        for channel_map in maps:
+            for channel in channel_map.values():
+                await channel.stop()
+        await dispose_engines()
