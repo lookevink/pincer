@@ -1398,6 +1398,15 @@ async def _run_agent(settings: Settings) -> None:
         else:
             console.print("[yellow]Signal enabled but PINCER_SIGNAL_PHONE_NUMBER not set[/yellow]")
 
+    if settings.sendblue_enabled:
+        from pincer.channels.sendblue import SendblueChannel
+
+        sendblue = SendblueChannel(settings, identity=identity)
+        await sendblue.start(on_message)
+        channel_map[sendblue.name] = sendblue
+        router.register(ChannelType.SENDBLUE, sendblue)
+        console.print("[green]Sendblue webhook listening at /webhooks/sendblue[/green]")
+
     # Slack channel (optional — requires PINCER_SLACK_BOT_TOKEN + PINCER_SLACK_APP_TOKEN)
     slk = None
     if settings.slack_bot_token.get_secret_value() and settings.slack_app_token.get_secret_value():
