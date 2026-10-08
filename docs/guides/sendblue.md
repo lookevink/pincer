@@ -36,7 +36,7 @@ pincer run
 
 Keep the same signing secret across restarts and store credentials in your secret
 manager or Pincer's local `.env` (never commit it). All phone numbers must use E.164
-format, such as `+15555550101`. An empty allowlist fails startup; `["*"]` explicitly
+format, such as `+15555550101`. An empty allowlist denies all senders; `["*"]` explicitly
 allows any sender. A configured Pincer identity map is an additional inbound gate:
 add the sender as `sendblue:+15555550101` using the normal identity setup.
 

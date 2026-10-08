@@ -2,7 +2,7 @@
 
 import asyncio
 import json
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, MagicMock
 
 import httpx
 import pytest
@@ -338,9 +338,12 @@ async def test_unsupported_attachments_never_call_provider(channel, monkeypatch)
     request.assert_not_called()
 
 
-@pytest.mark.parametrize("enabled", [True, False])
+@pytest.mark.parametrize(
+    "enabled,start_error",
+    [(True, None), (False, None), (True, ValueError), (True, OSError), (True, ModuleNotFoundError)],
+)
 async def test_cli_sendblue_startup_registers_live_reply_and_proactive_routes(
-    sendblue_settings, mock_llm, session_manager, cost_tracker, tool_registry, monkeypatch, enabled
+    sendblue_settings, mock_llm, session_manager, cost_tracker, tool_registry, monkeypatch, enabled, start_error, capsys
 ):
     """Run real CLI channel wiring; stop before unrelated schedulers/signals start."""
     import importlib
@@ -360,6 +363,32 @@ async def test_cli_sendblue_startup_registers_live_reply_and_proactive_routes(
     settings.voice_enabled = False
     settings.voice_outbound_enabled = False
     settings.identity_map = f"owner@sendblue:{SENDER}"
+    telegram = None
+    occupied_listener = None
+    if start_error:
+        # An earlier channel must survive a missing SDK, invalid config or busy port.
+        settings.telegram_bot_token = SecretStr("fixture-token")
+        telegram = MagicMock(name="telegram-channel")
+        telegram.name = "telegram"
+        telegram.start = AsyncMock()
+        telegram.stop = AsyncMock()
+        monkeypatch.setattr("pincer.channels.telegram.TelegramChannel", lambda *a, **kw: telegram)
+        if start_error is ValueError:
+            settings.sendblue_api_key = SecretStr("")
+        elif start_error is OSError:
+            occupied_listener = await asyncio.start_server(lambda reader, writer: writer.close(), "127.0.0.1", 0)
+            settings.sendblue_webhook_port = occupied_listener.sockets[0].getsockname()[1]
+        else:
+            import builtins
+
+            original_import = builtins.__import__
+
+            def without_aiohttp(name, *args, **kwargs):
+                if name == "aiohttp":
+                    raise ModuleNotFoundError("sensitive fixture detail")
+                return original_import(name, *args, **kwargs)
+
+            monkeypatch.setattr(builtins, "__import__", without_aiohttp)
     agent = Agent(settings, mock_llm, session_manager, cost_tracker, tool_registry)
     rate_limiter = AsyncMock()
     core = SimpleNamespace(
@@ -405,6 +434,15 @@ async def test_cli_sendblue_startup_registers_live_reply_and_proactive_routes(
 
         with pytest.raises(ChannelsStarted):
             await cli._run_agent(settings)
+        if start_error:
+            assert maps == [{"telegram": telegram}]
+            assert routers[0].channels == {ChannelType.TELEGRAM: telegram}
+            telegram.start.assert_awaited_once()
+            telegram.stop.assert_not_awaited()
+            output = capsys.readouterr().out
+            assert f"Sendblue failed to start ({start_error.__name__})" in output
+            assert "sensitive fixture detail" not in output
+            return
         channel = maps[0]["sendblue"]
         router = routers[0]
         assert router.channels == {ChannelType.SENDBLUE: channel}
@@ -442,8 +480,89 @@ async def test_cli_sendblue_startup_registers_live_reply_and_proactive_routes(
             assert any("Hello! I'm Pincer." in m.content for m in session.messages if m.content)
             assert await router.send(ChannelType.SENDBLUE, SENDER, "CLI reminder")
             assert received[-1] == {"number": SENDER, "from_number": LINE, "content": "CLI reminder"}
+
+            # A Sendblue-only deployment must deny approval-required tools.
+            from pincer.llm.base import LLMResponse, ToolCall
+
+            executed = []
+
+            async def risky() -> str:
+                executed.append(True)
+                return "unsafe side effect"
+
+            tool_registry.register(name="risky", description="Requires approval", handler=risky, require_approval=True)
+            mock_llm.complete.side_effect = [
+                LLMResponse(
+                    content="",
+                    model="test",
+                    input_tokens=1,
+                    output_tokens=1,
+                    stop_reason="tool_use",
+                    tool_calls=[ToolCall(id="approval-check", name="risky", arguments={})],
+                ),
+                LLMResponse(
+                    content="Action declined", model="test", input_tokens=1, output_tokens=1, stop_reason="end_turn"
+                ),
+            ]
+            async with ClientSession(base_url=f"http://127.0.0.1:{port}") as client:
+                assert (await post(client, event(message_handle="approval", content="Run risky"))).status == 200
+                await asyncio.wait_for(channel._queue.join(), 10)
+            assert not executed
+            session = await session_manager.get_or_create(canonical, "sendblue")
+            assert any(
+                m.tool_call_id == "approval-check" and "declined" in (m.content or "").lower() for m in session.messages
+            )
+            assert "Action declined" in received[-1]["content"]
     finally:
+        if occupied_listener is not None:
+            occupied_listener.close()
+            await occupied_listener.wait_closed()
         for channel_map in maps:
             for channel in channel_map.values():
                 await channel.stop()
         await dispose_engines()
+
+
+async def test_invalid_header_bytes_fail_authentication(channel):
+    port = channel._runner.addresses[0][1]
+    reader, writer = await asyncio.open_connection("127.0.0.1", port)
+    try:
+        writer.write(
+            b"POST /webhooks/sendblue HTTP/1.1\r\nHost: localhost\r\n"
+            b"sb-signing-secret: \xff\xfe\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+        )
+        await writer.drain()
+        assert b" 401 " in await asyncio.wait_for(reader.readline(), 2)
+        channel._handler.assert_not_called()
+    finally:
+        writer.close()
+        await writer.wait_closed()
+
+
+async def test_unknown_charset_cannot_raise_server_error(channel, client):
+    headers = {"sb-signing-secret": SECRET, "Content-Type": "application/json; charset=nope"}
+    response = await client.post("/webhooks/sendblue", data=b"{", headers=headers)
+    assert response.status == 400
+    channel._handler.assert_not_called()
+    response = await client.post("/webhooks/sendblue", data=json.dumps(event()).encode(), headers=headers)
+    assert response.status == 200
+    await channel._queue.join()
+    channel._handler.assert_awaited_once()
+
+
+async def test_empty_allowlist_starts_but_denies_all(sendblue_settings):
+    sendblue_settings.sendblue_allow_from = []
+    channel = SendblueChannel(sendblue_settings)
+    handler = AsyncMock(return_value="")
+    try:
+        await channel.start(handler)
+        port = channel._runner.addresses[0][1]
+        async with ClientSession(base_url=f"http://127.0.0.1:{port}") as client:
+            assert (await post(client, event())).status == 200
+        await channel._queue.join()
+        handler.assert_not_called()
+        assert not channel._seen
+        with pytest.raises(ValueError, match="allowlist"):
+            await channel.send(SENDER, "blocked")
+    finally:
+        await channel.stop()

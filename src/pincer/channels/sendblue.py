@@ -60,10 +60,9 @@ class SendblueChannel(BaseChannel):
                 cfg.sendblue_api_secret.get_secret_value(),
                 cfg.sendblue_signing_secret.get_secret_value(),
                 _PHONE.fullmatch(cfg.sendblue_from_number),
-                cfg.sendblue_allow_from,
             )
         ):
-            raise ValueError("Sendblue requires API credentials, a signing secret, an E.164 line and an allowlist")
+            raise ValueError("Sendblue requires API credentials, a signing secret, an E.164 line")
         if any(number != "*" and not _PHONE.fullmatch(number) for number in cfg.sendblue_allow_from):
             raise ValueError("Sendblue allowlist entries must be E.164 numbers or explicit '*'")
         self._handler = handler
@@ -104,12 +103,12 @@ class SendblueChannel(BaseChannel):
     async def _receive(self, request: web.Request) -> web.Response:
         from aiohttp import web
 
-        supplied = request.headers.get("sb-signing-secret", "").encode()
+        supplied = request.headers.get("sb-signing-secret", "").encode("utf-8", "surrogateescape")
         expected = self._settings.sendblue_signing_secret.get_secret_value().encode()
         if not expected or not hmac.compare_digest(supplied, expected):
             return web.Response(status=401)
         try:
-            payload = await request.json()
+            payload = json.loads(await request.read())
         except (ValueError, UnicodeDecodeError):
             return web.Response(status=400)
         if not isinstance(payload, dict):
