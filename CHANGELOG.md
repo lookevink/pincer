@@ -177,8 +177,10 @@ retried callbacks.
   its timeout line says nothing was heard instead of "we've been on a while".
   Phase instructions no longer leak internal state names (`VERIFY`/`FREEFORM`).
 - **Repeated calls to the same number replayed earlier calls.** The voice LLM
-  session (`voice:<number>`) is cleared at call start; cross-call memory stays
-  in the thread context block.
+  session is now keyed per call (`voice:<call_sid>`) on both the streaming turn
+  and the blocking guard-regeneration path, so concurrent calls with one party
+  never share or clear each other's history; cross-call memory stays in the
+  thread context block.
 - `voice_max_response_tokens` default raised from 150 to 220 — a conversational
   German reply needs the room. Removed the unused `voice/outbound_prompts.py` and
   `VOICE_GREETING_OUTBOUND`.

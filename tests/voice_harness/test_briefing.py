@@ -73,10 +73,6 @@ class BriefingAgent:
         self.language = language
         self.calls: list[dict[str, Any]] = []
         self.turn = 0
-        self.resets: list[str] = []
-
-    async def reset_voice_session(self, user_id: str, channel: str = "voice") -> None:
-        self.resets.append(user_id)
 
     def _task(self, extra_system: str) -> str:
         for heading in self.TASK_HEADINGS:
@@ -301,10 +297,13 @@ async def test_inbound_call_still_captures_intent():
     assert channel._state_machines[CALL].phase is CallPhase.INTENT_CAPTURE
 
 
-async def test_each_call_starts_with_a_fresh_llm_session():
-    """Repeated calls to one number must not replay the previous calls' turns."""
-    _channel, _engine, agent, _state = await _start(TASK_EN)
-    assert agent.resets == [TARGET]
+async def test_each_call_has_its_own_llm_session():
+    """The session is keyed by the call, not the number: repeated or concurrent
+    calls with one party never replay or clear each other's turns."""
+    _channel, engine, agent, _state = await _start(TASK_EN)
+    await engine.on_speech_input(CALL, "Hello, this is Müller.")
+    await engine.on_speech_input(CALL, "Go on.")
+    assert {c["session_key"] for c in agent.calls} == {f"voice:{CALL}"}
 
 
 async def test_missing_briefing_is_visible_in_this_harness():

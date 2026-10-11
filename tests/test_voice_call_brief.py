@@ -109,17 +109,24 @@ async def test_briefing_is_localised():
             "Das Gespräch hat Vorrang vor dem Skript",
             ("(verbindlich)", "themenfremde", "beenden Sie das Gespräch"),
         ),
+        (
+            "uk",
+            "Розмова важливіша за сценарій",
+            ("(обов'язкове)", "сторонню допомогу", "і ввічливо завершіть розмову"),
+        ),
     ],
-    ids=["en", "de"],
+    ids=["en", "de", "uk"],
 )
 async def test_outbound_brief_allows_topic_change(language, allows, forbidden):
     """The purpose is the goal of the call, not a fence: a callee who changes
-    the subject gets an answer, not a deflection back to the task."""
+    the subject gets an answer, not a deflection back to the task. Checked on
+    the assembled prompt: the brief must reach it, and no other block may
+    bring the binding wording back."""
     channel, state, sm = await _channel_and_state(language=language, target_number="+4930123456", purpose=PURPOSE)
-    brief = channel._call_brief(state, language, "sie")
-    assert allows in brief
+    prompt = channel._build_voice_system(state, sm)
+    assert allows in prompt
     for phrase in forbidden:
-        assert phrase not in brief, phrase
+        assert phrase not in prompt, phrase
 
 
 async def test_inbound_call_has_no_briefing():

@@ -115,18 +115,26 @@ class SessionManager:
         user_id: str,
         channel: str,
         pincer_user_id: str = "",
+        session_key: str | None = None,
     ) -> Session:
         """Get existing session or create a new one.
 
         If pincer_user_id is provided, it's used as the session key prefix
         for cross-channel continuity; otherwise falls back to channel:user_id.
+        ``session_key`` overrides both with an exact key (a phone call's
+        session, which must not depend on how its user was resolved).
         """
-        key = _session_key(pincer_user_id, "unified") if pincer_user_id else _session_key(user_id, channel)
+        if session_key:
+            key = session_key
+        elif pincer_user_id:
+            key = _session_key(pincer_user_id, "unified")
+        else:
+            key = _session_key(user_id, channel)
 
         if key in self._cache:
             return self._cache[key]
 
-        row = await self._store.load(key, user_id=user_id, channel=channel)
+        row = await self._store.load(key, user_id=user_id, channel=channel, legacy_fallback=not session_key)
 
         if row:
             messages = [LLMMessage.from_dict(m) for m in json.loads(row["messages"])]

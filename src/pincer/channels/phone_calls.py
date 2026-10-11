@@ -134,12 +134,6 @@ class VoiceChannel(BaseChannel):
             await self._prepare_thread_context(call_sid, state)
         except Exception:
             logger.exception("Thread context preparation failed [%s]", call_sid)
-        reset_session = getattr(self._stream_agent, "reset_voice_session", None)
-        if reset_session is not None:
-            try:
-                await reset_session(self._session_user_id(state))
-            except Exception:
-                logger.exception("Voice session reset failed [%s]", call_sid)
         # The briefing goes into the call's own transcript, so "what was the
         # agent told to do?" is answerable from the record the user can open,
         # not only from the logs of the process that placed the call.
@@ -148,9 +142,11 @@ class VoiceChannel(BaseChannel):
         record_briefing(self._transcripts.get(call_sid), briefing_from_state(state))
 
     @staticmethod
-    def _session_user_id(state: CallState) -> str:
-        """Who a call's LLM session belongs to — reset at call start, used on every turn."""
-        return state.pincer_user_id or state.caller_number
+    def _session_key(state: CallState) -> str:
+        """The call's own LLM session. Keyed by call, not by number: two calls
+        with the same party (an inbound one while an outbound one is live)
+        must never share or clear each other's history."""
+        return f"voice:{state.call_sid}"
 
     async def _prepare_thread_context(self, call_sid: str, state: CallState) -> None:
         """Sprint 13 §4.3/§7: resolve this call's thread and freeze its prompt
@@ -840,6 +836,7 @@ class VoiceChannel(BaseChannel):
             text=text,
             channel_type=ChannelType.VOICE,
             extra_system=extra_system,
+            session_key=self._session_key(state),
         )
 
         async def _regenerate(note: str) -> str | None:
@@ -853,6 +850,7 @@ class VoiceChannel(BaseChannel):
                 text=note,
                 channel_type=ChannelType.VOICE,
                 extra_system=extra_system,
+                session_key=self._session_key(state),
             )
             return await self._handler(retry)
 
@@ -962,7 +960,7 @@ class VoiceChannel(BaseChannel):
         full_text = ""
         end_requested = False  # [END_CALL] seen in the reply
         spoken_text = ""  # what was actually sent to TTS this turn
-        canonical_id = self._session_user_id(state)
+        canonical_id = state.pincer_user_id or state.caller_number
 
         # Only ConversationRelay buffers partial tokens and needs an explicit
         # last=True closer; per-utterance engines (Media Streams, harness)
@@ -1057,6 +1055,7 @@ class VoiceChannel(BaseChannel):
                 extra_system=extra_system,
                 channel_user_id=state.caller_number,
                 timings=agent_timings,
+                session_key=self._session_key(state),
             ):
                 if chunk.type == StreamEventType.TEXT:
                     stamp("llm_first_token_ms")
@@ -1165,6 +1164,7 @@ class VoiceChannel(BaseChannel):
                 text=note,
                 channel_type=ChannelType.VOICE,
                 extra_system=extra_system,
+                session_key=self._session_key(state),
             )
             return await self._handler(retry)
 

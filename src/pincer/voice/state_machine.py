@@ -137,6 +137,7 @@ VALID_TRANSITIONS: dict[CallPhase, set[CallPhase]] = {
     CallPhase.VERIFY: {
         CallPhase.EXECUTE,
         CallPhase.INTENT_CAPTURE,
+        CallPhase.FREEFORM,  # outbound: a declined confirmation resumes the conversation
         CallPhase.ERROR_RECOVERY,
         CallPhase.ENDING,
         # Sprint 12: a receptionist read-back the caller declines — or a slot
@@ -158,6 +159,7 @@ VALID_TRANSITIONS: dict[CallPhase, set[CallPhase]] = {
     },
     CallPhase.ERROR_RECOVERY: {
         CallPhase.INTENT_CAPTURE,
+        CallPhase.FREEFORM,
         CallPhase.ENDING,
         CallPhase.FAILED,
     },

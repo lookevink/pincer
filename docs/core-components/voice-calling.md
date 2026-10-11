@@ -391,8 +391,8 @@ call runs in the `FREEFORM` phase, whose instruction is conversation-first;
 inbound calls still go through `INTENT_CAPTURE`. A user who wants a call kept
 strictly on topic says so in the instructions, which render under the brief.
 
-Each call starts with an empty LLM session, so earlier calls to the same
-number don't replay into this one. Continuity across calls comes from the
+Each call has its own LLM session (`voice:<call_sid>`), so earlier or
+concurrent calls with the same number never replay into this one. Continuity across calls comes from the
 thread context block (below), not raw history.
 
 The persona itself also forbids capability talk ("MUST NOT enumerate
