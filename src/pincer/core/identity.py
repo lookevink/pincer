@@ -63,6 +63,9 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+#: Names no identity may take: `/api/identity/me` is the caller's own identity.
+RESERVED_IDENTITY_NAMES = frozenset({"me"})
+
 # Channels whose IDs are phone numbers — leading "+" is stripped for storage
 _PHONE_CHANNELS = {ChannelType.WHATSAPP, ChannelType.VOICE, ChannelType.SIGNAL}
 
@@ -323,19 +326,25 @@ class IdentityResolver:
         deleted with it. Passing ``channels`` allows config IDs to be translated
         to real internal IDs before the whitelist is built.
 
-        When no config is set the method is a no-op (nothing to enforce).
+        When no config is set the method is a no-op (nothing to enforce), and
+        so it is when any entry does not parse: a whitelist with a hole in it
+        must not be enforced.
         """
         if not self._identity_map_config:
             return
 
         allowed: set[tuple[str, str]] = set()
         for raw_entry in self._identity_map_config.split(","):
-            if ":" not in raw_entry:
+            if not raw_entry.strip():
                 continue
             try:
                 _, pairs = self._parse_mapping(raw_entry)
-            except ValueError:
-                continue
+            except ValueError as e:
+                # Its channels are unknown, so the whitelist is incomplete:
+                # pruning against it would delete the very identity the
+                # entry was meant to keep.
+                logger.error("Identity map entry %r is invalid (%s) — skipping cleanup", raw_entry.strip(), e)
+                return
             for ch, cid in pairs:
                 ch_type = ChannelType(ch)
                 norm = self._normalize_id(ch_type, cid)
@@ -594,7 +603,8 @@ class IdentityResolver:
             name@ch1:id1=ch2:id2=ch3:id3   (named canonical ID, N channels)
             ch1:id1=ch2:id2                 (hash-based, backward compat)
 
-        Raises ValueError if no channel:id pairs are found.
+        Raises ValueError if no channel:id pairs are found, or if the name is
+        reserved (see RESERVED_IDENTITY_NAMES).
         """
         entry = entry.strip()
         name: str | None = None
@@ -603,6 +613,8 @@ class IdentityResolver:
         at_pos = entry.find("@")
         if 0 < at_pos < (eq_pos if eq_pos >= 0 else len(entry)):
             raw_name = entry[:at_pos].strip()
+            if raw_name.lower() in RESERVED_IDENTITY_NAMES:
+                raise ValueError(f"Identity name {raw_name!r} is reserved")
             if raw_name:
                 name = raw_name
             entry = entry[at_pos + 1 :]

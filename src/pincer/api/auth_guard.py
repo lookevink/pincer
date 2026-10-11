@@ -34,6 +34,10 @@ PUBLIC_PATHS = (
     "/api/health",
     "/api/docs",
     "/api/openapi.json",
+    # Where a caller without a token gets one. Both run the brute-force guard
+    # themselves (see pincer.api.auth).
+    "/api/auth/login",
+    "/api/auth/refresh",
     # The website's "try it now" call: there is no token on a marketing page.
     # It defends itself instead — feature flag, explicit consent, and three
     # rate limits (see pincer.api.public_demo).
@@ -61,14 +65,20 @@ class _Attempts:
     failures: int = 0
     locked_until: float = 0.0
     last_seen: float = field(default_factory=time.monotonic)
+    #: Attempts admitted by `reserve` whose outcome is not known yet.
+    in_flight: int = 0
 
 
 class AuthGuard:
     """Per-IP failure budget with exponential lockout."""
 
-    def __init__(self, max_failures: int = 10, lockout_seconds: int = 300) -> None:
+    def __init__(self, max_failures: int = 10, lockout_seconds: int = 300, *, escalate: bool = True) -> None:
         self.max_failures = max(1, max_failures)
         self.lockout_seconds = max(1, lockout_seconds)
+        #: False for a key an attacker can aim at someone else (an account
+        #: name): each lockout is then one flat window with a fresh budget
+        #: after it, instead of doubling towards an hour on a single retry.
+        self.escalate = escalate
         self._ips: dict[str, _Attempts] = {}
 
     def _prune(self, now: float) -> None:
@@ -77,7 +87,9 @@ class AuthGuard:
         stale = [
             ip
             for ip, a in self._ips.items()
-            if a.locked_until <= now and now - a.last_seen > self.lockout_seconds + MAX_LOCKOUT_SECONDS
+            if a.in_flight <= 0
+            and a.locked_until <= now
+            and now - a.last_seen > self.lockout_seconds + MAX_LOCKOUT_SECONDS
         ]
         for ip in stale:
             del self._ips[ip]
@@ -91,17 +103,49 @@ class AuthGuard:
             return 0
         return max(1, int(attempts.locked_until - now) + 1)
 
+    def reserve(self, ip: str) -> int:
+        """Claim one attempt before a credential is checked. Returns 0 when
+        the attempt may go ahead (pair it with `release`), else the seconds
+        to wait.
+
+        `retry_after` alone only sees failures that were already recorded, so
+        any number of requests sent together would all pass it and each get a
+        guess. Here the attempts still being verified count against what is
+        left of the budget: no more run at once than could fail before the
+        lockout starts.
+        """
+        wait = self.retry_after(ip)
+        if wait:
+            return wait
+        attempts = self._ips.setdefault(ip, _Attempts())
+        # A flat-window lock that has run out is a fresh budget (see `record_failure`).
+        expired = not self.escalate and attempts.locked_until > 0
+        failures = 0 if expired else attempts.failures
+        if attempts.in_flight >= max(1, self.max_failures + 1 - failures):
+            return 1
+        attempts.in_flight += 1
+        attempts.last_seen = time.monotonic()
+        return 0
+
+    def release(self, ip: str) -> None:
+        """Give back an attempt claimed with `reserve`, once its outcome is known."""
+        attempts = self._ips.get(ip)
+        if attempts is not None and attempts.in_flight > 0:
+            attempts.in_flight -= 1
+
     def record_failure(self, ip: str) -> int:
         """Count a failed authentication. Returns the resulting lockout seconds (0 = none)."""
         now = time.monotonic()
         attempts = self._ips.setdefault(ip, _Attempts())
+        if not self.escalate and 0 < attempts.locked_until <= now:
+            attempts.failures, attempts.locked_until = 0, 0.0
         attempts.failures += 1
         attempts.last_seen = now
         # `max_failures` attempts are free; the lockout starts on the next one.
         over = attempts.failures - self.max_failures - 1
         if over < 0:
             return 0
-        backoff = min(self.lockout_seconds * (2**over), MAX_LOCKOUT_SECONDS)
+        backoff = min(self.lockout_seconds * (2**over if self.escalate else 1), MAX_LOCKOUT_SECONDS)
         attempts.locked_until = now + backoff
         logger.warning(
             "API auth lockout: %s failed %d time(s), locked for %.0fs",
@@ -113,7 +157,14 @@ class AuthGuard:
 
     def record_success(self, ip: str) -> None:
         """A valid token clears the IP's failure history."""
-        self._ips.pop(ip, None)
+        attempts = self._ips.get(ip)
+        if attempts is None:
+            return
+        if attempts.in_flight > 0:
+            # Other attempts are still being verified; their reservations live here.
+            attempts.failures, attempts.locked_until = 0, 0.0
+            return
+        del self._ips[ip]
 
     def reset(self) -> None:
         self._ips.clear()

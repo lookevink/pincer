@@ -45,7 +45,7 @@ from typing import Any
 
 from pincer.channels.base import ChannelType
 from pincer.config.toml_loader import read_toml_raw
-from pincer.core.identity import IdentityProfile
+from pincer.core.identity import RESERVED_IDENTITY_NAMES, IdentityProfile
 
 _KEY_PATTERN = re.compile(r"^[a-zA-Z0-9_]+$")
 
@@ -83,7 +83,7 @@ def load_identity_config(config_dir: Path | None = None) -> dict[str, IdentityTo
     """Load and merge the [identity] section from pincer.toml + pincer.local.toml.
 
     Returns entries keyed by pincer_user_id, in TOML definition order.
-    Raises ValueError on an invalid person key, an unknown channel, or a
+    Raises ValueError on an invalid or reserved person key, an unknown channel, or a
     (channel, channel_user_id) pair reused across two different people —
     config mistakes should fail loudly at startup, not be silently absorbed.
     """
@@ -103,6 +103,8 @@ def load_identity_config(config_dir: Path | None = None) -> dict[str, IdentityTo
     for person_key, person_raw in identity_raw.items():
         if not _KEY_PATTERN.match(person_key):
             raise ValueError(f"identity key must be alphanumeric/underscore: '{person_key}'")
+        if person_key.lower() in RESERVED_IDENTITY_NAMES:
+            raise ValueError(f"identity key '{person_key}' is reserved")
 
         preferred_channel = person_raw.get("preferred_channel")
         if preferred_channel is not None:
@@ -172,9 +174,15 @@ def resolve_identity_map_config(
       grammar has no field for any of these.
 
     PINCER_IDENTITY_MAP, when non-empty, is returned as-is — the TOML
-    [identity] section is not even read in that case.
+    [identity] section is not even read in that case. Raises ValueError when
+    it names a reserved identity, exactly as the TOML loader does.
     """
     if env_value:
+        for raw_entry in env_value.split(","):
+            name, at, _ = raw_entry.partition("@")
+            # `name@ch:id=…` only; in the unnamed form an "@" belongs to an id.
+            if at and "=" not in name and name.strip().lower() in RESERVED_IDENTITY_NAMES:
+                raise ValueError(f"identity key '{name.strip()}' is reserved")
         return env_value, {}
 
     entries = load_identity_config(config_dir)
