@@ -887,6 +887,10 @@ class Agent:
 
         yield StreamChunk(StreamEventType.DONE, full_text)
 
+    async def end_voice_session(self, session_key: str) -> None:
+        """Drop a finished call's session from the cache (see ``stream_voice_turn``)."""
+        await self._sessions.evict(session_key)
+
     async def stream_voice_turn(
         self,
         user_id: str,

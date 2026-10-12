@@ -306,6 +306,22 @@ async def test_each_call_has_its_own_llm_session():
     assert {c["session_key"] for c in agent.calls} == {f"voice:{CALL}"}
 
 
+async def test_call_end_releases_the_calls_llm_session():
+    """A key per call would grow the agent's session cache with every call;
+    hangup hands the call's key back so the session is dropped."""
+    agent = BriefingAgent()
+    ended: list[str] = []
+
+    async def _end_voice_session(session_key: str) -> None:
+        ended.append(session_key)
+
+    agent.end_voice_session = _end_voice_session  # type: ignore[attr-defined]
+    _channel, engine, _agent, _state = await _start(TASK_EN, agent=agent)
+    await engine.on_speech_input(CALL, "Hello, this is Müller.")
+    await engine.end_call(CALL)
+    assert ended == [f"voice:{CALL}"]
+
+
 async def test_missing_briefing_is_visible_in_this_harness():
     """Control: with no task in the prompt, the scripted brain falls into the
     exact capability monologue the scenarios above assert against. Without

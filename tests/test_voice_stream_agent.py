@@ -161,6 +161,20 @@ class TestStreamVoiceTurn:
         assert [m.content for m in provider.calls[1]["messages"]] == ["Hallo", "Sure, in English.", "[Reply in German]"]
         assert result.text == "Gern auf Deutsch."  # no onboarding question appended
 
+    async def test_end_voice_session_persists_and_evicts(self, settings, session_manager, cost_tracker, tool_registry):
+        """A key per call must not grow the session cache forever: call end
+        drops the session, with its history kept in the store."""
+        settings.voice_turn_model = ""
+        provider = ScriptedProvider([_text_turn("Gerne.")])
+        agent = Agent(settings, provider, session_manager, cost_tracker, tool_registry)
+
+        await _collect(agent, user_id="+4930111222", channel="voice", text="Hallo", session_key="voice:CA_a")
+        await agent.end_voice_session("voice:CA_a")
+
+        assert "voice:CA_a" not in session_manager._cache
+        reloaded = await session_manager.get_or_create("+4930111222", "voice", session_key="voice:CA_a")
+        assert [m.content for m in reloaded.messages] == ["Hallo", "Gerne."]
+
     async def test_voice_turn_model_override(self, settings, session_manager, cost_tracker, tool_registry):
         settings.voice_turn_model = "fast-model-x"
         provider = ScriptedProvider([_text_turn("Ok, mache ich sofort.")])

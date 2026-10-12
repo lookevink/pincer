@@ -190,6 +190,13 @@ class SessionManager:
         session.updated_at = time.time()
         await self._persist(session)
 
+    async def evict(self, key: str) -> None:
+        """Persist and drop one session from the cache (a phone call's, at
+        hangup — a key per call would otherwise grow the cache forever)."""
+        session = self._cache.pop(key, None)
+        if session is not None:
+            await self._persist(session)
+
     async def _persist(self, session: Session) -> None:
         """Write the session out."""
         await self._store.save(

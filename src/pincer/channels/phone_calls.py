@@ -1306,6 +1306,11 @@ class VoiceChannel(BaseChannel):
         if session is not None:
             with contextlib.suppress(Exception):
                 await session.on_call_end()
+        # The call's LLM session is keyed by call, so nothing reuses it once
+        # the call is over — drop it from the session cache.
+        if self._stream_agent is not None:
+            with contextlib.suppress(Exception):
+                await self._stream_agent.end_voice_session(self._session_key(state))
 
         completed = True
         if sm is not None:
