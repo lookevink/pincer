@@ -288,6 +288,33 @@ retried callbacks.
 - `voice_max_response_tokens` default raised from 150 to 220 — a conversational
   German reply needs the room. Removed the unused `voice/outbound_prompts.py` and
   `VOICE_GREETING_OUTBOUND`.
+- **The `sqlite_vec_memory` embedding model now really is cached where the
+  config says.** `pincer.toml` and the `sqlite-vec-memory-mcp` image set
+  `FASTEMBED__CACHE_DIR` / `FASTEMBED_CACHE_DIR`, which fastembed ignores, so
+  the model was kept in `$TMPDIR/fastembed_cache` instead. They now set
+  `FASTEMBED_CACHE_PATH`. **On upgrade, stdio and host installs (the server
+  started from `pincer.toml`) download the model once more** (about 65 MB)
+  into `${PINCER_DATA_DIR}/fastembed_cache`. A host with no network access has
+  no memory embedding until the model is there: copy the `models--…`
+  directory from the old `$TMPDIR/fastembed_cache` into
+  `${PINCER_DATA_DIR}/fastembed_cache` before starting. The
+  `sqlite-vec-memory-mcp` image needs nothing: the model is built into it.
+- **Pincer no longer takes another application's `alembic_version`.** The
+  upgrade renamed any `alembic_version` it found to `pincer_alembic_version`,
+  so in a database shared with another Alembic application it took that
+  application's history and read its revision as Pincer's. It now renames only
+  its own (one of Pincer's revisions, beside Pincer's tables) and builds
+  `pincer_alembic_version` beside anyone else's. **An unknown revision beside
+  Pincer's tables now stops the upgrade** with an error instead of replaying
+  every revision over the schema: run the Pincer version that has that
+  revision (a fork or feature branch), or, if the table belongs to another
+  application, give Pincer its own database or schema.
+- **Two Pincer processes starting together on Postgres no longer fail the
+  second one's migration.** `pincer` and `pincer-tasks` both upgrade at start;
+  the second now waits on an advisory lock held for the whole upgrade (logging
+  that it is waiting), then finds the database current. The lock is held in a
+  transaction on a second connection for as long as the upgrade runs, so a
+  pooler or `idle_in_transaction_session_timeout` must allow that.
 
 ### Added
 

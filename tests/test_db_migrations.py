@@ -3,7 +3,12 @@
 import contextlib
 import importlib.util
 import json
+import logging
 import sqlite3
+import subprocess
+import sys
+import threading
+import time
 import uuid
 from datetime import UTC, datetime
 from pathlib import Path
@@ -15,6 +20,7 @@ from alembic import command
 from alembic.script import ScriptDirectory
 
 from pincer.db import build_config, engine, ensure_schema_current
+from pincer.db.metadata import LEGACY_VERSION_TABLE, MIGRATION_ADVISORY_KEY, VERSION_TABLE
 
 EXPECTED_TABLES = {
     "pincer_conversations",
@@ -61,6 +67,7 @@ def test_ensure_schema_current_creates_all_tables(tmp_path: Path) -> None:
     tables = _tables(db_path)
     assert tables >= EXPECTED_TABLES
     assert "pincer_alembic_version" in tables
+    assert "alembic_version" not in tables
 
 
 def test_ensure_schema_current_is_idempotent(tmp_path: Path) -> None:
@@ -1601,6 +1608,354 @@ def test_0018_round_trips_without_losing_the_ids(migration_url, tmp_path):
         assert conn.execute(sa.text("SELECT turn_id FROM telephony_events WHERE event_id = 'ev-2'")).scalar_one() == ""
 
     command.upgrade(cfg, "0018")
+
+
+# ── env.py: renaming only Pincer's own `alembic_version` ──────────────
+
+_CREATE_LEGACY_VERSION_TABLE = (
+    f"CREATE TABLE {LEGACY_VERSION_TABLE} (version_num VARCHAR(32) NOT NULL, "
+    f"CONSTRAINT {LEGACY_VERSION_TABLE}_pkc PRIMARY KEY (version_num))"
+)
+
+
+def _version_rows(conn: sa.Connection) -> dict[str, list[str]]:
+    """Every Alembic version table in the database and the revisions it records."""
+    tables = set(sa.inspect(conn).get_table_names())
+    return {
+        table: list(conn.execute(sa.text(f"SELECT version_num FROM {table}")).scalars())
+        for table in (LEGACY_VERSION_TABLE, VERSION_TABLE)
+        if table in tables
+    }
+
+
+def _legacy_pincer_db(url: str, tmp_path: Path, revision: str):
+    """Pincer's own database at `revision`, as migrated before `0019` named the
+    version table: its history in Alembic's default `alembic_version`."""
+    cfg = _config(url, tmp_path)
+    command.upgrade(cfg, revision)
+    with _connect(url) as conn:
+        conn.execute(sa.text(f"ALTER TABLE {VERSION_TABLE} RENAME TO {LEGACY_VERSION_TABLE}"))
+        if conn.dialect.name == "postgresql":
+            # Its primary key under the name Alembic gave it back then.
+            conn.execute(
+                sa.text(
+                    f"ALTER TABLE {LEGACY_VERSION_TABLE} "
+                    f"RENAME CONSTRAINT {VERSION_TABLE}_pkc TO {LEGACY_VERSION_TABLE}_pkc"
+                )
+            )
+    return cfg
+
+
+def _foreign_app_db(url: str, tmp_path: Path, revision: str, table: str):
+    """Another Alembic application's database: its history in `alembic_version`
+    at `revision`, beside one table of its own."""
+    with _connect(url) as conn:
+        conn.execute(sa.text(_CREATE_LEGACY_VERSION_TABLE))
+        conn.execute(sa.text(f"INSERT INTO {LEGACY_VERSION_TABLE} (version_num) VALUES (:v)"), {"v": revision})
+        conn.execute(sa.text(f"CREATE TABLE {table} (id INTEGER PRIMARY KEY)"))
+    return _config(url, tmp_path)
+
+
+def test_pincer_s_own_legacy_version_table_is_renamed_with_its_revision(migration_url, tmp_path, caplog):
+    """Upgrading to 0011 runs only 0011: the 0010 Alembic finds is the one the
+    legacy table recorded, now under the new name."""
+    cfg = _legacy_pincer_db(migration_url, tmp_path, "0010")
+
+    with caplog.at_level(logging.INFO, logger="pincer.db.migrations"):
+        command.upgrade(cfg, "0011")
+
+    with _connect(migration_url) as conn:
+        assert _version_rows(conn) == {"pincer_alembic_version": ["0011"]}
+    # Nobody else was migrating, so there was nothing to wait for or say.
+    assert _waiting_lines(caplog) == []
+
+
+def test_another_app_s_version_table_is_left_alone(migration_url, tmp_path):
+    """Its revision id is one Pincer also has (other apps also number their
+    revisions 0001, 0002, …), but no Pincer table is there."""
+    cfg = _foreign_app_db(migration_url, tmp_path, "0005", "other_app_users")
+    head = ScriptDirectory.from_config(cfg).get_current_head()
+
+    command.upgrade(cfg, "head")
+
+    with _connect(migration_url) as conn:
+        assert _version_rows(conn) == {"alembic_version": ["0005"], "pincer_alembic_version": [head]}
+        tables = set(sa.inspect(conn).get_table_names())
+    assert "other_app_users" in tables
+    assert EXPECTED_TABLES - {"pincer_memories_fts"} <= tables
+
+
+def test_an_unknown_revision_beside_pincer_tables_is_refused(migration_url, tmp_path):
+    """Pincer's own legacy database, at a revision this checkout doesn't have
+    (a fork's, say). Neither renamed nor left for Alembic to replay `0001` over."""
+    cfg = _legacy_pincer_db(migration_url, tmp_path, "0010")
+    with _connect(migration_url) as conn:
+        conn.execute(sa.text(f"UPDATE {LEGACY_VERSION_TABLE} SET version_num = 'f00dfeedcafe'"))
+
+    with pytest.raises(RuntimeError, match=r"records revision\(s\) \['f00dfeedcafe'\].*does not have"):
+        command.upgrade(cfg, "head")
+
+    with _connect(migration_url) as conn:
+        assert _version_rows(conn) == {"alembic_version": ["f00dfeedcafe"]}
+
+
+def _pre_alembic_pincer_db(url: str, tmp_path: Path):
+    """Pincer's tables as an install from before Alembic left them: `0001`'s
+    schema (so `channel_identities` is there) and no version table of Pincer's."""
+    cfg = _config(url, tmp_path)
+    command.upgrade(cfg, "0001")
+    with _connect(url) as conn:
+        conn.execute(sa.text(f"DROP TABLE {VERSION_TABLE}"))
+    return cfg
+
+
+def test_another_app_s_version_table_without_a_version_column_is_left_alone(migration_url, tmp_path):
+    """Beside Pincer's tables, so the bootstrap gets as far as looking at it:
+    no `version_num` column, so not Alembic's history of Pincer."""
+    cfg = _pre_alembic_pincer_db(migration_url, tmp_path)
+    with _connect(migration_url) as conn:
+        conn.execute(sa.text(f"CREATE TABLE {LEGACY_VERSION_TABLE} (id INTEGER PRIMARY KEY, label TEXT)"))
+        conn.execute(sa.text(f"INSERT INTO {LEGACY_VERSION_TABLE} (id, label) VALUES (1, 'theirs')"))
+    head = ScriptDirectory.from_config(cfg).get_current_head()
+
+    command.upgrade(cfg, "head")
+
+    with _connect(migration_url) as conn:
+        assert conn.execute(sa.text(f"SELECT id, label FROM {LEGACY_VERSION_TABLE}")).all() == [(1, "theirs")]
+        assert conn.execute(sa.text(f"SELECT version_num FROM {VERSION_TABLE}")).scalars().all() == [head]
+
+
+def test_another_role_s_unreadable_version_table_is_left_alone(migration_url, tmp_path):
+    """Beside Pincer's tables, so the bootstrap reads it: Pincer's role has no
+    grant on the other app's `alembic_version`, though the catalog still lists
+    it, and the permission error means "not ours", not a crash."""
+    if not migration_url.startswith("postgresql"):
+        pytest.skip("SQLite has no roles or grants")
+    role = f"pincer_app_{uuid.uuid4().hex[:8]}"
+    with _connect(migration_url) as conn:
+        conn.execute(sa.text(f"CREATE ROLE {role} LOGIN PASSWORD 'pincer'"))
+        conn.execute(sa.text(f"GRANT ALL ON SCHEMA public TO {role}"))
+    as_role = sa.engine.make_url(migration_url).set(username=role, password="pincer")
+    try:
+        cfg = _pre_alembic_pincer_db(as_role.render_as_string(hide_password=False), tmp_path)
+        _foreign_app_db(migration_url, tmp_path, "0005", "other_app_users")
+        head = ScriptDirectory.from_config(cfg).get_current_head()
+
+        command.upgrade(cfg, "head")
+
+        with _connect(migration_url) as conn:
+            assert _version_rows(conn) == {"alembic_version": ["0005"], "pincer_alembic_version": [head]}
+    finally:
+        with _connect(migration_url) as conn:
+            conn.execute(sa.text(f"DROP OWNED BY {role}"))
+            conn.execute(sa.text(f"DROP ROLE {role}"))
+
+
+def test_a_failed_read_of_pincer_s_own_version_table_fails_the_upgrade(migration_url, tmp_path, monkeypatch):
+    """A lock timeout on Pincer's own legacy `alembic_version` says nothing
+    about whose table it is. Taking it as "not ours" would have Alembic replay
+    every revision over Pincer's schema; the upgrade must fail instead, before
+    `pincer_alembic_version` exists."""
+    if not migration_url.startswith("postgresql"):
+        pytest.skip("needs a lock on one table; SQLite's locks cover the whole file, catalog included")
+    cfg = _legacy_pincer_db(migration_url, tmp_path, "0010")
+    # libpq reads it on connect: every connection opened from here on gives up
+    # on a lock after 200 ms instead of waiting.
+    monkeypatch.setenv("PGOPTIONS", "-c lock_timeout=200")
+
+    holder = sa.create_engine(migration_url)
+    try:
+        with holder.connect() as other:
+            other.execute(sa.text(f"LOCK TABLE {LEGACY_VERSION_TABLE} IN ACCESS EXCLUSIVE MODE"))
+            with pytest.raises(sa.exc.OperationalError, match="lock timeout"):
+                command.upgrade(cfg, "head")
+            other.rollback()
+    finally:
+        holder.dispose()
+
+    with _connect(migration_url) as conn:
+        assert _version_rows(conn) == {"alembic_version": ["0010"]}
+
+
+def test_a_second_start_beside_another_app_s_version_table_leaves_it_alone(migration_url, tmp_path):
+    """Once Pincer's schema is built, the foreign table holds a revision id
+    Pincer also has and a Pincer table is present: only `VERSION_TABLE`
+    already existing keeps the bootstrap from taking it."""
+    cfg = _foreign_app_db(migration_url, tmp_path, "0005", "other_app_users")
+    head = ScriptDirectory.from_config(cfg).get_current_head()
+    command.upgrade(cfg, "head")
+
+    command.upgrade(cfg, "head")
+
+    with _connect(migration_url) as conn:
+        assert _version_rows(conn) == {"alembic_version": ["0005"], "pincer_alembic_version": [head]}
+
+
+def _wait_for_migration_lock_waiters(conn: sa.Connection, count: int, errors: list[BaseException]) -> None:
+    """Return once `count` sessions are queued on the migration advisory lock in
+    this database; fail after 30 s, or as soon as an upgrader has failed instead."""
+    deadline = time.monotonic() + 30.0
+    while True:
+        waiting = conn.execute(
+            sa.text(
+                "SELECT count(*) FROM pg_locks WHERE locktype = 'advisory' AND NOT granted "
+                "AND database = (SELECT oid FROM pg_database WHERE datname = current_database()) "
+                "AND classid::bigint = :high AND objid::bigint = :low"
+            ),
+            {"high": MIGRATION_ADVISORY_KEY >> 32, "low": MIGRATION_ADVISORY_KEY & 0xFFFFFFFF},
+        ).scalar_one()
+        if waiting >= count:
+            return
+        assert not errors, f"an upgrader failed before waiting on the lock: {errors!r}"
+        assert time.monotonic() < deadline, f"{waiting} of {count} upgraders queued on the migration lock after 30 s"
+        time.sleep(0.01)
+
+
+def _waiting_lines(caplog: pytest.LogCaptureFixture) -> list[str]:
+    return [r.levelname for r in caplog.records if r.getMessage().startswith("Waiting for another Pincer process")]
+
+
+def test_a_concurrent_start_waits_for_the_other_rename(migration_url, tmp_path, caplog):
+    """A second process holds the migration lock and renames the table itself
+    meanwhile; this one must wait for it, then find the new name and carry on."""
+    if not migration_url.startswith("postgresql"):
+        pytest.skip("SQLite serialises the whole upgrade behind ensure_schema_current's file lock")
+    cfg = _legacy_pincer_db(migration_url, tmp_path, "0010")
+    errors: list[BaseException] = []
+
+    def upgrade() -> None:
+        try:
+            command.upgrade(cfg, "0011")
+        except BaseException as exc:  # surfaced on the test thread below
+            errors.append(exc)
+
+    holder = sa.create_engine(migration_url)
+    try:
+        with holder.connect() as other:
+            other.execute(sa.text("SELECT pg_advisory_xact_lock(:key)"), {"key": MIGRATION_ADVISORY_KEY})
+            worker = threading.Thread(target=upgrade)
+            with caplog.at_level(logging.INFO, logger="pincer.db.migrations"):
+                worker.start()
+                _wait_for_migration_lock_waiters(other, 1, errors)
+                other.execute(sa.text("ALTER TABLE alembic_version RENAME TO pincer_alembic_version"))
+                other.commit()
+                worker.join(timeout=60)
+    finally:
+        holder.dispose()
+
+    assert not worker.is_alive()
+    assert errors == []
+    with _connect(migration_url) as conn:
+        assert _version_rows(conn) == {"pincer_alembic_version": ["0011"]}
+    assert _waiting_lines(caplog) == ["INFO"]
+
+
+def test_a_lost_lock_connection_does_not_fail_a_committed_upgrade(migration_url, tmp_path, caplog):
+    """The lock's connection dies while it sits idle mid-migration (a firewall,
+    `idle_session_timeout`). The server released the lock with it; the
+    migration still commits, and ending the lock's transaction must not then
+    fail the upgrade."""
+    if not migration_url.startswith("postgresql"):
+        pytest.skip("SQLite takes no advisory lock")
+    cfg = _legacy_pincer_db(migration_url, tmp_path, "0018")
+    head = ScriptDirectory.from_config(cfg).get_current_head()
+    errors: list[BaseException] = []
+
+    def upgrade() -> None:
+        try:
+            command.upgrade(cfg, "head")
+        except BaseException as exc:  # surfaced on the test thread below
+            errors.append(exc)
+
+    in_this_database = "database = (SELECT oid FROM pg_database WHERE datname = current_database())"
+    holder = sa.create_engine(migration_url)
+    try:
+        with holder.connect() as other:
+            # Holds 0019 up at its first rename, with the lock already taken.
+            other.execute(sa.text("LOCK TABLE audit_logs IN ACCESS EXCLUSIVE MODE"))
+            worker = threading.Thread(target=upgrade)
+            with caplog.at_level(logging.WARNING, logger="pincer.db.migrations"):
+                worker.start()
+                deadline = time.monotonic() + 30.0
+                while not other.execute(
+                    sa.text(
+                        "SELECT count(*) FROM pg_locks WHERE locktype = 'relation' AND NOT granted "
+                        f"AND {in_this_database}"
+                    )
+                ).scalar_one():
+                    assert not errors, errors
+                    assert time.monotonic() < deadline, "the migration never reached the locked table"
+                    time.sleep(0.01)
+                terminated = (
+                    other.execute(
+                        sa.text(
+                            "SELECT pg_terminate_backend(pid) FROM pg_locks WHERE locktype = 'advisory' AND granted "
+                            f"AND {in_this_database} AND classid::bigint = :high AND objid::bigint = :low"
+                        ),
+                        {"high": MIGRATION_ADVISORY_KEY >> 32, "low": MIGRATION_ADVISORY_KEY & 0xFFFFFFFF},
+                    )
+                    .scalars()
+                    .all()
+                )
+                assert terminated == [True]
+                other.rollback()
+                worker.join(timeout=60)
+    finally:
+        holder.dispose()
+
+    assert not worker.is_alive()
+    assert errors == []
+    with _connect(migration_url) as conn:
+        assert _version_rows(conn) == {"pincer_alembic_version": [head]}
+    assert [r.levelname for r in caplog.records if r.name == "pincer.db.migrations"] == ["WARNING"]
+
+
+_UPGRADE_SCRIPT = """
+import sys
+from pathlib import Path
+
+from alembic import command
+
+from pincer.db import build_config
+
+cfg = build_config(Path(sys.argv[2]) / "unused.db")
+cfg.set_main_option("sqlalchemy.url", sys.argv[1])
+command.upgrade(cfg, "head")
+"""
+
+
+def test_two_concurrent_upgraders_of_a_legacy_database_both_come_up(migration_url, tmp_path):
+    """`pincer` and `pincer-tasks` starting together on a database with `0019`
+    and its version-table rename pending. Both are held at the lock until both
+    are queued, then let go: the second must wait out the first's whole
+    upgrade and find the database at head, not race it through `0019`."""
+    if not migration_url.startswith("postgresql"):
+        pytest.skip("SQLite serialises the whole upgrade behind ensure_schema_current's file lock")
+    cfg = _legacy_pincer_db(migration_url, tmp_path, "0018")
+    head = ScriptDirectory.from_config(cfg).get_current_head()
+
+    holder = sa.create_engine(migration_url)
+    try:
+        with holder.connect() as other:
+            other.execute(sa.text("SELECT pg_advisory_xact_lock(:key)"), {"key": MIGRATION_ADVISORY_KEY})
+            upgraders = [
+                subprocess.Popen(
+                    [sys.executable, "-c", _UPGRADE_SCRIPT, migration_url, str(tmp_path)],
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.STDOUT,
+                    text=True,
+                )
+                for _ in range(2)
+            ]
+            _wait_for_migration_lock_waiters(other, 2, [])
+            other.commit()
+        outputs = [upgrader.communicate(timeout=120)[0] for upgrader in upgraders]
+    finally:
+        holder.dispose()
+
+    assert [upgrader.returncode for upgrader in upgraders] == [0, 0], "\n\n".join(outputs)
+    with _connect(migration_url) as conn:
+        assert _version_rows(conn) == {"pincer_alembic_version": [head]}
 
 
 # ── 0020: orphaned webhook_retry schedules ─────────────────────────────
