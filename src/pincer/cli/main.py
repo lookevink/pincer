@@ -1,8 +1,13 @@
 """Pincer CLI — the main entry point.
 
 Usage:
-    pincer run          Start the agent
+    pincer run          Start the agent (or attach to the background one, if it is running)
+    pincer run -d       Start the agent in the background; returns once its channels are up
     pincer run tasks    Start only the background task worker (requires PINCER_TASK_BROKER=redis)
+    pincer logs         Print the background agent's log (-n N: last N lines, -f: follow)
+    pincer status       Show whether the background agent is running
+    pincer stop         Stop the background agent gracefully (--force kills it)
+    pincer restart      Stop the background agent and start a new one from here
     pincer config       Show current configuration
     pincer cost         Show today's spend
 """
@@ -16,6 +21,7 @@ from pincer.cli import (
     chat,
     config,
     cost,
+    daemon,
     db,
     doctor,
     google,
@@ -40,6 +46,10 @@ app = AsyncTyper(
 )
 
 app.command(name="run")(run_cmd.run)
+app.command()(daemon.stop)
+app.command()(daemon.restart)
+app.command()(daemon.logs)
+app.command()(daemon.status)
 app.command()(config.config)
 app.command()(cost.cost)
 app.command(name="init")(init.init)
