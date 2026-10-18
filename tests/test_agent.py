@@ -441,3 +441,127 @@ async def test_execute_tool_genuine_error_still_logs_error_with_traceback(
     error_records = [r for r in caplog.records if r.levelno >= logging.ERROR]
     assert len(error_records) == 1
     assert error_records[0].exc_info is not None
+
+
+async def test_unavailable_memories_warn_and_still_reply(
+    settings, mock_llm, session_manager, cost_tracker, tool_registry, caplog
+):
+    """A failing memory backend costs the user their memories, not their reply — and says so at WARNING."""
+    memory = AsyncMock()
+    memory.search_text.side_effect = ConnectionError("memory backend down")
+    agent = Agent(settings, mock_llm, session_manager, cost_tracker, tool_registry, memory_store=memory)
+
+    with caplog.at_level(logging.DEBUG, logger="pincer.core.agent"):
+        result = await agent.handle_message("user1", "test", "Hello!")
+
+    assert "Hello! I'm Pincer." in result.text
+    memory.search_text.assert_awaited()
+    system_prompt = mock_llm.complete.call_args.kwargs["system"]
+    assert "[Relevant memories about this user]" not in system_prompt
+
+    warnings = [
+        r
+        for r in caplog.records
+        if r.levelno == logging.WARNING and r.getMessage() == "Failed to fetch memories for prompt"
+    ]
+    assert len(warnings) == 1
+    assert warnings[0].exc_info is not None
+
+
+def _outage_log(caplog: pytest.LogCaptureFixture, failure: str, recovery: str) -> list[tuple[str, bool]]:
+    """(level, has traceback) of each failure/recovery record, in order."""
+    return [
+        (record.levelname, record.exc_info is not None)
+        for record in caplog.records
+        if record.getMessage() in {failure, recovery}
+    ]
+
+
+async def test_an_unavailable_memory_backend_warns_once_per_outage(
+    settings, mock_llm, session_manager, cost_tracker, tool_registry, caplog
+):
+    """Once per message would flood the log for the length of an outage."""
+    memory = AsyncMock()
+    memory.search_text.side_effect = [
+        ConnectionError("down"),
+        ConnectionError("still down"),
+        [],
+        ConnectionError("again"),
+    ]
+    agent = Agent(settings, mock_llm, session_manager, cost_tracker, tool_registry, memory_store=memory)
+
+    with caplog.at_level(logging.DEBUG, logger="pincer.core.agent"):
+        for _ in range(4):
+            await agent.handle_message("user1", "test", "Hello!")
+
+    assert memory.search_text.await_count == 4
+    assert _outage_log(caplog, "Failed to fetch memories for prompt", "Fetching memories for prompt recovered") == [
+        ("WARNING", True),
+        ("DEBUG", True),
+        ("INFO", False),
+        ("WARNING", True),
+    ]
+
+
+async def test_an_unavailable_mcp_server_list_warns_once_per_outage(
+    settings, mock_llm, session_manager, cost_tracker, tool_registry, caplog
+):
+    agent = Agent(settings, mock_llm, session_manager, cost_tracker, tool_registry)
+    agent.mcp_manager = AsyncMock()
+    agent.mcp_manager.list_servers.side_effect = [
+        RuntimeError("down"),
+        RuntimeError("still down"),
+        [],
+        RuntimeError("again"),
+    ]
+
+    with caplog.at_level(logging.DEBUG, logger="pincer.core.agent"):
+        for _ in range(4):
+            await agent.handle_message("user1", "test", "Hello!")
+
+    assert agent.mcp_manager.list_servers.await_count == 4
+    assert _outage_log(
+        caplog, "Failed to fetch MCP server list for prompt", "Fetching the MCP server list for prompt recovered"
+    ) == [("WARNING", True), ("DEBUG", True), ("INFO", False), ("WARNING", True)]
+
+
+class _Unprintable:
+    @property
+    def content(self) -> str:
+        raise RuntimeError("cannot render")
+
+
+async def test_a_memory_that_fails_to_render_warns_once_and_never_recovers(
+    settings, mock_llm, session_manager, cost_tracker, tool_registry, caplog
+):
+    """The fetch succeeds, then formatting it fails: that is one outage, not a
+    recovery followed by a new failure on every message."""
+    memory = AsyncMock()
+    memory.search_text.return_value = [_Unprintable()]
+    agent = Agent(settings, mock_llm, session_manager, cost_tracker, tool_registry, memory_store=memory)
+
+    with caplog.at_level(logging.DEBUG, logger="pincer.core.agent"):
+        for _ in range(3):
+            await agent.handle_message("user1", "test", "Hello!")
+
+    assert _outage_log(caplog, "Failed to fetch memories for prompt", "Fetching memories for prompt recovered") == [
+        ("WARNING", True),
+        ("DEBUG", True),
+        ("DEBUG", True),
+    ]
+
+
+async def test_an_mcp_server_list_that_fails_to_render_warns_once_and_never_recovers(
+    settings, mock_llm, session_manager, cost_tracker, tool_registry, caplog
+):
+    agent = Agent(settings, mock_llm, session_manager, cost_tracker, tool_registry)
+    agent.mcp_manager = AsyncMock()
+    agent.mcp_manager.list_servers.return_value = [{"connected": True}]  # no "name": formatting raises
+
+    with caplog.at_level(logging.DEBUG, logger="pincer.core.agent"):
+        for _ in range(3):
+            await agent.handle_message("user1", "test", "Hello!")
+
+    assert _outage_log(
+        caplog, "Failed to fetch MCP server list for prompt", "Fetching the MCP server list for prompt recovered"
+    ) == [("WARNING", True), ("DEBUG", True), ("DEBUG", True)]

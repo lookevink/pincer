@@ -1,6 +1,14 @@
 from __future__ import annotations
 
-from pydantic import BaseModel, Field, SecretStr, field_validator
+import re
+from typing import Annotated
+
+from pydantic import BaseModel, Field, SecretStr, TypeAdapter, field_validator
+from pydantic_settings import NoDecode
+
+
+def is_sendblue_phone(value: str) -> bool:
+    return re.fullmatch(r"\+[1-9][0-9]{7,14}", value) is not None
 
 
 class ChannelSettings(BaseModel):
@@ -10,9 +18,16 @@ class ChannelSettings(BaseModel):
     sendblue_api_secret: SecretStr = Field(default=SecretStr(""))
     sendblue_signing_secret: SecretStr = Field(default=SecretStr(""))
     sendblue_from_number: str = Field(default="")
-    sendblue_allow_from: list[str] = Field(default_factory=list)
-    sendblue_webhook_host: str = Field(default="127.0.0.1")
-    sendblue_webhook_port: int = Field(default=8787, ge=1, le=65535)
+    sendblue_allow_from: Annotated[list[str], NoDecode] = Field(default_factory=list)
+
+    @field_validator("sendblue_allow_from", mode="before")
+    @classmethod
+    def parse_sendblue_allowlist(cls, value: str | list[str]) -> list[str]:
+        if isinstance(value, str):
+            if value.lstrip().startswith("["):
+                return TypeAdapter(list[str]).validate_json(value)
+            return [number.strip() for number in value.split(",") if number.strip()]
+        return value
 
     # ── Telegram ─────────────────────────────────────────
     telegram_bot_token: SecretStr = Field(default=SecretStr(""), description="Telegram bot token")
@@ -211,7 +226,7 @@ class ChannelSettings(BaseModel):
         "Also switchable at runtime from the dashboard (PUT /api/voice/config).",
     )
     voice_max_response_tokens: int = Field(
-        default=150,
+        default=220,
         ge=32,
         le=1024,
         description="max_tokens per voice turn — short spoken replies keep latency and streaming granularity tight",

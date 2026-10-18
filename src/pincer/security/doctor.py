@@ -19,8 +19,15 @@ from enum import StrEnum
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
+from pincer.config.channels import is_sendblue_phone
+
 if TYPE_CHECKING:
     from pincer.config import Settings
+
+
+#: The shared API tokens removed in favour of per-identity auth (issue #228).
+#: Named here only so `pincer doctor` can point out a leftover one.
+_REMOVED_TOKEN_VARS = ("PINCER_DASHBOARD_TOKEN", "PINCER_WEB_CHAT_TOKEN")
 
 
 class CheckStatus(StrEnum):
@@ -88,7 +95,7 @@ class SecurityDoctor:
         self,
         data_dir: Path | None = None,
         config_dir: Path | None = None,
-        skills_dir: Path | None = None,
+        skills_dir: str | Path | None = None,
         production: bool = False,
     ) -> None:
         self.data_dir = data_dir or Path("data")
@@ -123,13 +130,14 @@ class SecurityDoctor:
         report.checks.append(self._check_whatsapp_neonize_version())
         report.checks.append(self._check_discord_allowlist(settings))
         report.checks.append(self._check_dashboard_auth_token(settings))
+        report.checks.append(self._check_stale_shared_tokens())
         # Budget (3 checks)
         report.checks.append(self._check_budget_limits(settings))
         report.checks.append(self._check_rate_limits(settings))
         report.checks.append(self._check_tool_call_limits(settings))
         # Filesystem (4 checks)
         report.checks.append(self._check_data_dir_permissions())
-        report.checks.append(self._check_skills_dir_permissions())
+        report.checks.append(self._check_skills_dir_permissions(settings))
         report.checks.append(self._check_no_world_readable_secrets())
         report.checks.append(self._check_sqlite_not_world_readable())
         # Network (2 checks)
@@ -167,6 +175,9 @@ class SecurityDoctor:
         # Live listen-in (1 check, Sprint 15)
         report.checks.append(self._check_listen_in_announce(settings))
         # Signal (3 checks, Sprint 7.5)
+        report.checks.append(self._check_sendblue_credentials(settings))
+        report.checks.append(self._check_sendblue_access(settings))
+        report.checks.append(self._check_sendblue_listener(settings))
         report.checks.append(self._check_signal_phone_set(settings))
         report.checks.append(self._check_signal_api_local(settings))
         report.checks.append(self._check_signal_access_control(settings))
@@ -255,42 +266,44 @@ class SecurityDoctor:
     def _check_prod_auth_tokens(self, cfg: Settings | None = None) -> CheckResult:
         """Every HTTP surface must be authenticated in production."""
         settings = self._cfg(cfg)
-        missing: list[str] = []
-        # T8.2: an empty token means allow-all in the API middleware. Both the
-        # dashboard and the web-chat surface must carry their own strong token
-        # in production — a shared or absent one is a full API bypass.
-        for field_name, env in (
-            ("dashboard_token", "PINCER_DASHBOARD_TOKEN"),
-            ("web_chat_token", "PINCER_WEB_CHAT_TOKEN"),
-        ):
-            try:
-                value = getattr(settings, field_name).get_secret_value()
-            except AttributeError:
-                value = ""
-            if not value:
-                missing.append(env)
-            elif len(value) < 16:
-                missing.append(f"{env} (too short, use 32+ chars)")
-        try:
-            if (
-                settings.dashboard_token.get_secret_value()
-                and settings.dashboard_token.get_secret_value() == settings.web_chat_token.get_secret_value()
-            ):
-                missing.append("PINCER_WEB_CHAT_TOKEN (identical to the dashboard token — issue separate ones)")
-        except AttributeError:
-            pass
-        if missing:
+        # `is True`, not truthiness: the API is default-deny, and only the
+        # explicit dev flag opens it.
+        if getattr(settings, "auth_disabled", False) is True:
             return CheckResult(
                 name="prod_auth_tokens",
                 status=CheckStatus.CRITICAL,
-                message=f"API auth token missing or weak: {', '.join(missing)}",
-                fix_hint="Generate one: python -c 'import secrets; print(secrets.token_urlsafe(32))'",
+                message="API authentication is disabled (PINCER_AUTH_DISABLED=true): every /api route is open",
+                fix_hint="Remove PINCER_AUTH_DISABLED from the production environment",
+                category="production",
+            )
+        try:
+            jwt_secret = str(settings.jwt_secret.get_secret_value() or "")
+        except AttributeError:
+            jwt_secret = ""
+        if not jwt_secret:
+            # Without it the secret is a file under data_dir: fine for one
+            # container on a persistent volume, but a redeploy onto a fresh
+            # disk signs everyone out and two replicas reject each other's
+            # sessions.
+            return CheckResult(
+                name="prod_auth_tokens",
+                status=CheckStatus.WARNING,
+                message="PINCER_JWT_SECRET is not set; sessions are signed with a secret generated into the data dir",
+                fix_hint="Generate one: python -c 'import secrets; print(secrets.token_urlsafe(48))'",
+                category="production",
+            )
+        if len(jwt_secret) < 32:
+            return CheckResult(
+                name="prod_auth_tokens",
+                status=CheckStatus.CRITICAL,
+                message="PINCER_JWT_SECRET is too short (use 32+ chars)",
+                fix_hint="Generate one: python -c 'import secrets; print(secrets.token_urlsafe(48))'",
                 category="production",
             )
         return CheckResult(
             name="prod_auth_tokens",
             status=CheckStatus.PASS,
-            message="Dashboard API token set",
+            message="API authentication enabled, JWT secret set",
             category="production",
         )
 
@@ -1110,6 +1123,22 @@ class SecurityDoctor:
 
     # ── Access Control ────────────────────────────────────
 
+    def _identity_map(self, cfg: Settings, name: str, category: str) -> str | CheckResult:
+        """The effective identity map, or the finding to report when it does
+        not load — `pincer run` refuses to start on the same error."""
+        from pincer.config.identity import resolve_identity_map_config
+
+        try:
+            return resolve_identity_map_config(cfg.identity_map, self.config_dir)[0]
+        except ValueError as e:
+            return CheckResult(
+                name,
+                CheckStatus.CRITICAL,
+                f"Identity map is invalid: {e}",
+                fix_hint="Fix PINCER_IDENTITY_MAP (or the [identity] TOML section); Pincer will not start with it",
+                category=category,
+            )
+
     def _check_telegram_access_control(self, cfg: Settings | None = None) -> CheckResult:
         cfg = self._cfg(cfg)
         if not cfg.telegram_bot_token.get_secret_value():
@@ -1119,9 +1148,9 @@ class SecurityDoctor:
                 "Telegram not configured",
                 category="access",
             )
-        from pincer.config.identity import resolve_identity_map_config
-
-        identity_map_config, _ = resolve_identity_map_config(cfg.identity_map, self.config_dir)
+        identity_map_config = self._identity_map(cfg, "telegram_access_control", "access")
+        if isinstance(identity_map_config, CheckResult):
+            return identity_map_config
         if identity_map_config:
             return CheckResult(
                 "telegram_access_control",
@@ -1149,9 +1178,9 @@ class SecurityDoctor:
                 "WhatsApp not configured",
                 category="access",
             )
-        from pincer.config.identity import resolve_identity_map_config
-
-        identity_map_config, _ = resolve_identity_map_config(cfg.identity_map, self.config_dir)
+        identity_map_config = self._identity_map(cfg, "whatsapp_access_control", "access")
+        if isinstance(identity_map_config, CheckResult):
+            return identity_map_config
         if identity_map_config:
             return CheckResult(
                 "whatsapp_access_control",
@@ -1262,28 +1291,82 @@ class SecurityDoctor:
         )
 
     def _check_dashboard_auth_token(self, cfg: Settings | None = None) -> CheckResult:
+        """Somebody must be able to sign in to the API and the dashboard.
+
+        There is no shared token any more: access is an identity with a
+        password or an API key (`pincer identity set-password` / `api-key`).
+        """
+        from pincer.services.auth import count_identities_with_credentials
+
         cfg = self._cfg(cfg)
-        token = cfg.dashboard_token.get_secret_value()
-        if token and len(token) >= 16:
-            return CheckResult(
-                "dashboard_auth_token",
-                CheckStatus.PASS,
-                "Dashboard auth token configured (16+ chars)",
-                category="access",
-            )
-        if token:
+        if getattr(cfg, "auth_disabled", False) is True:
             return CheckResult(
                 "dashboard_auth_token",
                 CheckStatus.WARNING,
-                "Dashboard token too short",
-                fix_hint='python -c "import secrets; print(secrets.token_hex(32))"',
+                "API authentication is disabled (PINCER_AUTH_DISABLED=true)",
+                fix_hint="Local development only. Unset PINCER_AUTH_DISABLED anywhere reachable.",
+                category="access",
+            )
+        try:
+            count = count_identities_with_credentials(Path(cfg.db_path))
+        except Exception as e:
+            # SQLAlchemy appends the full statement after the first line.
+            reason = (str(e).splitlines() or [type(e).__name__])[0]
+            return CheckResult(
+                "dashboard_auth_token",
+                CheckStatus.SKIPPED,
+                f"Could not read identity credentials: {reason}",
+                category="access",
+            )
+        if not count:
+            # A warning, not CRITICAL: with nobody able to sign in the API is
+            # closed, which is safe. It is also what the deploy gate sees —
+            # `scripts/deploy.sh` runs the doctor in a container without the
+            # data volume, before the first identity can exist.
+            return CheckResult(
+                "dashboard_auth_token",
+                CheckStatus.WARNING,
+                "No identity can sign in: nobody has a password or an API key",
+                fix_hint=(
+                    "pincer identity create <name> "
+                    "(or pincer identity set-password <name> for an identity that already exists)"
+                ),
                 category="access",
             )
         return CheckResult(
             "dashboard_auth_token",
-            CheckStatus.CRITICAL,
-            "No dashboard auth token!",
-            fix_hint="Set PINCER_DASHBOARD_TOKEN",
+            CheckStatus.PASS,
+            f"{count} identit{'y' if count == 1 else 'ies'} can sign in to the API",
+            category="access",
+        )
+
+    def _check_stale_shared_tokens(self) -> CheckResult:
+        """The shared API tokens were removed; a leftover one protects nothing.
+
+        `Settings` ignores unknown variables, so these are looked for where
+        they would be set: the process environment and the project `.env`.
+        """
+        from dotenv import dotenv_values
+
+        stale = {name for name in _REMOVED_TOKEN_VARS if os.environ.get(name)}
+        for env_file in (self.config_dir / ".env", self.config_dir.parent / ".env"):
+            try:
+                if env_file.is_file():
+                    stale |= {name for name in _REMOVED_TOKEN_VARS if dotenv_values(env_file).get(name)}
+            except OSError:
+                continue
+        if stale:
+            return CheckResult(
+                "stale_shared_tokens",
+                CheckStatus.WARNING,
+                f"{', '.join(sorted(stale))} set but no longer used: the API authenticates identities now",
+                fix_hint="Remove it; give callers a password or key with `pincer identity set-password` / `api-key`",
+                category="access",
+            )
+        return CheckResult(
+            "stale_shared_tokens",
+            CheckStatus.PASS,
+            "No leftover shared API tokens",
             category="access",
         )
 
@@ -1350,15 +1433,20 @@ class SecurityDoctor:
             category="filesystem",
         )
 
-    def _check_skills_dir_permissions(self) -> CheckResult:
-        if not self.skills_dir.exists():
+    def _check_skills_dir_permissions(self, cfg: Settings | None = None) -> CheckResult:
+        from pincer.tools.skills.storage import is_remote_uri
+
+        if isinstance(self.skills_dir, str) and is_remote_uri(self.skills_dir):
+            return self._check_remote_skills_root(self.skills_dir, self._cfg(cfg))
+        skills_dir = Path(self.skills_dir)
+        if not skills_dir.exists():
             return CheckResult(
                 "skills_dir_permissions",
                 CheckStatus.SKIPPED,
                 "Skills dir doesn't exist yet",
                 category="filesystem",
             )
-        mode = oct(self.skills_dir.stat().st_mode)[-3:]
+        mode = oct(skills_dir.stat().st_mode)[-3:]
         if mode in ("700", "750", "755"):
             return CheckResult(
                 "skills_dir_permissions",
@@ -1371,6 +1459,49 @@ class SecurityDoctor:
             CheckStatus.WARNING,
             f"Skills dir permissions: {mode}",
             fix_hint="chmod 750 ~/.pincer/skills/",
+            category="filesystem",
+        )
+
+    def _check_remote_skills_root(self, uri: str, cfg: Settings) -> CheckResult:
+        """Remote roots have no POSIX mode to check; verify the extra is installed
+        and the root answers instead."""
+        from pincer.exceptions import SkillLoadError
+        from pincer.tools.skills.storage import open_skills_root
+
+        try:
+            root = open_skills_root(uri, cfg)
+            reachable = root.exists()
+        except SkillLoadError as e:
+            return CheckResult(
+                "skills_dir_permissions",
+                CheckStatus.WARNING,
+                str(e),
+                fix_hint=(
+                    "pip install 'pincer-agent[remote-skills]' and check PINCER_SKILLS_DIR "
+                    "and the PINCER_STORAGE_* settings"
+                ),
+                category="filesystem",
+            )
+        except Exception as e:
+            return CheckResult(
+                "skills_dir_permissions",
+                CheckStatus.WARNING,
+                f"Remote skills root {uri} is unreachable: {type(e).__name__}",
+                fix_hint="Check the PINCER_STORAGE_* credential settings and network access to the bucket",
+                category="filesystem",
+            )
+        if not reachable:
+            return CheckResult(
+                "skills_dir_permissions",
+                CheckStatus.WARNING,
+                f"Remote skills root {uri} is reachable but empty or missing",
+                fix_hint="Upload skill directories (each with a SKILL.md) under that prefix",
+                category="filesystem",
+            )
+        return CheckResult(
+            "skills_dir_permissions",
+            CheckStatus.PASS,
+            f"Remote skills root reachable: {uri}",
             category="filesystem",
         )
 
@@ -1895,9 +2026,9 @@ class SecurityDoctor:
                 "Signal not enabled",
                 category="signal",
             )
-        from pincer.config.identity import resolve_identity_map_config
-
-        identity_map_config, _ = resolve_identity_map_config(cfg.identity_map, self.config_dir)
+        identity_map_config = self._identity_map(cfg, "signal_access_control", "signal")
+        if isinstance(identity_map_config, CheckResult):
+            return identity_map_config
         if identity_map_config:
             return CheckResult(
                 "signal_access_control",
@@ -2466,4 +2597,83 @@ class SecurityDoctor:
             CheckStatus.PASS,
             "Prompt injection detection is active on MCP tool outputs",
             category="mcp",
+        )
+
+    def _check_sendblue_credentials(self, cfg: Settings | None = None) -> CheckResult:
+        cfg = self._cfg(cfg)
+        if not cfg.sendblue_enabled:
+            return CheckResult("sendblue_credentials", CheckStatus.SKIPPED, "Sendblue disabled", category="sendblue")
+        if not all(
+            (
+                cfg.sendblue_api_key.get_secret_value(),
+                cfg.sendblue_api_secret.get_secret_value(),
+                cfg.sendblue_signing_secret.get_secret_value(),
+            )
+        ):
+            return CheckResult(
+                "sendblue_credentials",
+                CheckStatus.CRITICAL,
+                "Sendblue requires API credentials and a webhook signing secret",
+                "Set PINCER_SENDBLUE_API_KEY, API_SECRET and SIGNING_SECRET",
+                category="sendblue",
+            )
+        if not is_sendblue_phone(cfg.sendblue_from_number):
+            return CheckResult(
+                "sendblue_credentials",
+                CheckStatus.CRITICAL,
+                "Sendblue sending line is not E.164",
+                "Set PINCER_SENDBLUE_FROM_NUMBER to the assigned line",
+                category="sendblue",
+            )
+        return CheckResult(
+            "sendblue_credentials", CheckStatus.PASS, "Sendblue credentials and line configured", category="sendblue"
+        )
+
+    def _check_sendblue_access(self, cfg: Settings | None = None) -> CheckResult:
+        cfg = self._cfg(cfg)
+        if not cfg.sendblue_enabled:
+            return CheckResult("sendblue_access", CheckStatus.SKIPPED, "Sendblue disabled", category="sendblue")
+        if any(number != "*" and not is_sendblue_phone(number) for number in cfg.sendblue_allow_from):
+            return CheckResult(
+                "sendblue_access",
+                CheckStatus.CRITICAL,
+                "Sendblue allowlist contains invalid numbers",
+                "Use E.164 numbers in PINCER_SENDBLUE_ALLOW_FROM",
+                category="sendblue",
+            )
+        if "*" in cfg.sendblue_allow_from:
+            return CheckResult(
+                "sendblue_access",
+                CheckStatus.WARNING,
+                "Sendblue allows any phone sender",
+                "Use an explicit PINCER_SENDBLUE_ALLOW_FROM list",
+                category="sendblue",
+            )
+        if not cfg.sendblue_allow_from:
+            return CheckResult(
+                "sendblue_access",
+                CheckStatus.WARNING,
+                "Sendblue denies all senders (empty allowlist)",
+                "Add allowed E.164 numbers to PINCER_SENDBLUE_ALLOW_FROM",
+                category="sendblue",
+            )
+
+        return CheckResult(
+            "sendblue_access", CheckStatus.PASS, "Sendblue sender allowlist configured", category="sendblue"
+        )
+
+    def _check_sendblue_listener(self, cfg: Settings | None = None) -> CheckResult:
+        cfg = self._cfg(cfg)
+        if not cfg.sendblue_enabled:
+            return CheckResult("sendblue_listener", CheckStatus.SKIPPED, "Sendblue disabled", category="sendblue")
+        if cfg.dashboard_host not in ("127.0.0.1", "localhost", "::1"):
+            return CheckResult(
+                "sendblue_listener",
+                CheckStatus.WARNING,
+                "Sendblue shared API listener binds publicly",
+                "Use HTTPS ingress, restrict network access and keep the signing secret private",
+                category="sendblue",
+            )
+        return CheckResult(
+            "sendblue_listener", CheckStatus.PASS, "Sendblue uses the loopback API listener", category="sendblue"
         )

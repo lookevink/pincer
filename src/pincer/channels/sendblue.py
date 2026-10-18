@@ -3,28 +3,32 @@
 from __future__ import annotations
 
 import asyncio
-import contextlib
 import hmac
 import json
 import logging
-import re
 from collections import OrderedDict
+from functools import partial
 from typing import TYPE_CHECKING, Any
 
 import httpx
+from starlette.responses import Response
 
 from pincer.channels.base import BaseChannel, ChannelType, IncomingMessage
+from pincer.config.channels import is_sendblue_phone
 
 if TYPE_CHECKING:
-    from aiohttp import web
+    from starlette.requests import Request
 
     from pincer.channels.base import MessageHandler
     from pincer.config import Settings
     from pincer.core.identity import IdentityResolver
 
 logger = logging.getLogger(__name__)
-_PHONE = re.compile(r"\+[1-9][0-9]{7,14}\Z")
 _MEDIA_NOTICE = "[Attachment received; this channel supports text only. Please resend its contents as text.]"
+
+
+class SendblueConfigurationError(ValueError):
+    """Operator-actionable configuration error containing no supplied values."""
 
 
 class SendblueChannel(BaseChannel):
@@ -41,7 +45,10 @@ class SendblueChannel(BaseChannel):
         self._identity = identity
         self._handler: MessageHandler | None = None
         self._client: httpx.AsyncClient | None = None
-        self._runner: web.AppRunner | None = None
+        self._accepting = False
+        self._tasks: set[asyncio.Task[None]] = set()
+        self._senders: dict[str, asyncio.Task[None]] = {}
+        self._slots = asyncio.Semaphore(8)
         self._worker: asyncio.Task[None] | None = None
         self._queue: asyncio.Queue[IncomingMessage] = asyncio.Queue(maxsize=128)
         self._seen: OrderedDict[str, None] = OrderedDict()
@@ -50,21 +57,20 @@ class SendblueChannel(BaseChannel):
     def name(self) -> str:
         return "sendblue"
 
-    async def start(self, handler: MessageHandler) -> None:
-        from aiohttp import web
+    @property
+    def running(self) -> bool:
+        return self._accepting
 
+    async def start(self, handler: MessageHandler) -> None:
         cfg = self._settings
-        if not all(
-            (
-                cfg.sendblue_api_key.get_secret_value(),
-                cfg.sendblue_api_secret.get_secret_value(),
-                cfg.sendblue_signing_secret.get_secret_value(),
-                _PHONE.fullmatch(cfg.sendblue_from_number),
-            )
-        ):
-            raise ValueError("Sendblue requires API credentials, a signing secret, an E.164 line")
-        if any(number != "*" and not _PHONE.fullmatch(number) for number in cfg.sendblue_allow_from):
-            raise ValueError("Sendblue allowlist entries must be E.164 numbers or explicit '*'")
+        if not cfg.sendblue_api_key.get_secret_value() or not cfg.sendblue_api_secret.get_secret_value():
+            raise SendblueConfigurationError("Sendblue requires API key and API secret")
+        if not cfg.sendblue_signing_secret.get_secret_value():
+            raise SendblueConfigurationError("Sendblue requires a webhook signing secret")
+        if not is_sendblue_phone(cfg.sendblue_from_number):
+            raise SendblueConfigurationError("Sendblue sending line must be an E.164 number")
+        if any(number != "*" and not is_sendblue_phone(number) for number in cfg.sendblue_allow_from):
+            raise SendblueConfigurationError("Sendblue allowlist entries must be E.164 numbers or explicit '*'")
         self._handler = handler
         self._client = httpx.AsyncClient(
             base_url="https://api.sendblue.com",
@@ -75,74 +81,83 @@ class SendblueChannel(BaseChannel):
             timeout=30,
             follow_redirects=False,
         )
-        app = web.Application(client_max_size=65536)
-        app.router.add_post("/webhooks/sendblue", self._receive)
-        self._runner = web.AppRunner(app, access_log=None)
-        try:
-            await self._runner.setup()
-            await web.TCPSite(self._runner, cfg.sendblue_webhook_host, cfg.sendblue_webhook_port).start()
-            self._worker = asyncio.create_task(self._process())
-        except BaseException:
-            await self.stop()
-            raise
+        self._worker = asyncio.create_task(self._process())
+        self._accepting = True
 
     async def stop(self) -> None:
-        if self._runner:
-            await self._runner.cleanup()
-            self._runner = None
+        # Never run queued turns against services that are shutting down.
+        # Acknowledged in-memory work is not durable; cancellation is not replay.
+        self._accepting = False
         if self._worker:
-            with contextlib.suppress(TimeoutError):
-                await asyncio.wait_for(self._queue.join(), timeout=30)
             self._worker.cancel()
             await asyncio.gather(self._worker, return_exceptions=True)
             self._worker = None
+        tasks = list(self._tasks)
+        for task in tasks:
+            task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+        self._tasks.clear()
+        self._senders.clear()
+        while not self._queue.empty():
+            self._queue.get_nowait()
+            self._queue.task_done()
         if self._client:
             await self._client.aclose()
             self._client = None
 
-    async def _receive(self, request: web.Request) -> web.Response:
-        from aiohttp import web
-
-        supplied = request.headers.get("sb-signing-secret", "").encode("utf-8", "surrogateescape")
+    async def receive(self, request: Request) -> Response:
+        if not self._accepting:
+            return Response(status_code=503)
+        supplied = request.headers.get("sb-signing-secret", "").encode("latin-1")
         expected = self._settings.sendblue_signing_secret.get_secret_value().encode()
         if not expected or not hmac.compare_digest(supplied, expected):
-            return web.Response(status=401)
+            return Response(status_code=401)
         try:
-            payload = json.loads(await request.read())
+            body = bytearray()
+            async for chunk in request.stream():
+                if len(body) + len(chunk) > 65536:
+                    return Response(status_code=413)
+                body.extend(chunk)
+            payload = json.loads(body)
         except (ValueError, UnicodeDecodeError):
-            return web.Response(status=400)
+            return Response(status_code=400)
         if not isinstance(payload, dict):
-            return web.Response(status=400)
+            return Response(status_code=400)
         if (
             payload.get("is_outbound") is not False
             or payload.get("status") != "RECEIVED"
             or payload.get("group_id") not in (None, "")
             or payload.get("to_number") != self._settings.sendblue_from_number
         ):
-            return web.Response(status=200)
+            return Response(status_code=200)
         sender, handle = payload.get("from_number"), payload.get("message_handle")
         content, media = payload.get("content"), payload.get("media_url")
+        allowed = self._settings.sendblue_allow_from
+        if not isinstance(sender, str) or not is_sendblue_phone(sender):
+            return Response(status_code=200)
+        if sender not in allowed and "*" not in allowed:
+            return Response(status_code=200)
         if (
-            not isinstance(sender, str)
-            or not _PHONE.fullmatch(sender)
-            or not isinstance(handle, str)
+            not isinstance(handle, str)
             or not 0 < len(handle) <= 256
             or (content is not None and not isinstance(content, str))
             or (media is not None and not isinstance(media, str))
         ):
-            return web.Response(status=400)
-        allowed = self._settings.sendblue_allow_from
-        if sender not in allowed and "*" not in allowed:
-            return web.Response(status=200)
+            return Response(status_code=400)
         if self._identity and self._identity.has_config and await self._identity.is_guest(self.channel_type, sender):
-            return web.Response(status=200)
+            return Response(status_code=200)
         if handle in self._seen:
-            return web.Response(status=200)
+            return Response(status_code=200)
         text = content or ""
         if media:
             text = f"{text}\n{_MEDIA_NOTICE}".strip()
         if not text.strip():
-            return web.Response(status=200)
+            return Response(status_code=200)
+        # Body/identity awaits may race with stop(); admission below is atomic.
+        if not self._accepting:
+            return Response(status_code=503)
+        if self._queue.qsize() + len(self._tasks) >= 128:
+            return Response(status_code=503)
         try:
             self._queue.put_nowait(
                 IncomingMessage(
@@ -154,34 +169,67 @@ class SendblueChannel(BaseChannel):
                 )
             )
         except asyncio.QueueFull:
-            return web.Response(status=503)
+            return Response(status_code=503)
         self._seen[handle] = None
         if len(self._seen) > 4096:
             self._seen.popitem(last=False)
-        return web.Response(status=200)
+        return Response(status_code=200)
 
     async def _process(self) -> None:
         while True:
             message = await self._queue.get()
+            previous = self._senders.get(message.user_id)
+            task = asyncio.create_task(self._process_message(message, previous))
+            self._tasks.add(task)
+            self._senders[message.user_id] = task
+            task.add_done_callback(partial(self._finished, message.user_id))
+
+    def _finished(self, sender: str, task: asyncio.Task[None]) -> None:
+        self._tasks.discard(task)
+        if self._senders.get(sender) is task:
+            del self._senders[sender]
+        # A task cancelled before its first poll never executes a finally block.
+        self._queue.task_done()
+
+    async def _process_message(self, message: IncomingMessage, previous: asyncio.Task[None] | None) -> None:
+        if previous is not None:
+            await asyncio.shield(previous)
+        async with self._slots:
             try:
                 if self._handler is None:
                     raise RuntimeError("Sendblue handler not initialized")
                 reply = await self._handler(message)
-                if reply:
+            except Exception as exc:
+                self._log_failure("handler", message, exc)
+                # Handler failure happened before any reply POST. One best-effort
+                # notice is safe; a failed or ambiguous reply is never retried.
+                try:
+                    await self.send(message.user_id, "Sorry, I couldn't process your message. Please try again later.")
+                except Exception as notice_error:
+                    self._log_failure("failure notice", message, notice_error)
+                return
+            if reply:
+                try:
                     await self.send(message.user_id, reply)
-            except Exception:
-                # Provider exceptions can contain message text or credentials. Log only
-                # the failure and correlation handle; inspect delivery in Sendblue.
-                logger.error(
-                    "Sendblue processing failed for message %s; no automatic replay", message.reply_to_message_id
-                )
-            finally:
-                self._queue.task_done()
+                except Exception as exc:
+                    self._log_failure("reply", message, exc)
+
+    @staticmethod
+    def _log_failure(stage: str, message: IncomingMessage, exc: Exception) -> None:
+        logger.error(
+            "Sendblue %s failed (%s) for message %r; no automatic replay",
+            stage,
+            type(exc).__name__,
+            message.reply_to_message_id,
+        )
 
     async def send(self, user_id: str, text: str, **kwargs: Any) -> None:
         if not self._client:
             raise RuntimeError("Sendblue channel is not started")
-        if not _PHONE.fullmatch(user_id):
+        # IdentityResolver stores phone-channel IDs without '+'. Restore E.164
+        # at the provider boundary, before applying the configured allowlist.
+        user_id = user_id if user_id.startswith("+") else f"+{user_id}"
+        if not is_sendblue_phone(user_id):
             raise ValueError("Sendblue recipient must be an E.164 number")
         allowed = self._settings.sendblue_allow_from
         if user_id not in allowed and "*" not in allowed:
@@ -203,9 +251,10 @@ class SendblueChannel(BaseChannel):
             if (
                 not isinstance(data, dict)
                 or not isinstance(data.get("message_handle"), str)
-                or not data["message_handle"]
+                or not 0 < len(data["message_handle"]) <= 256
+                or any(ord(c) < 32 for c in data["message_handle"])
                 or data.get("error_code") not in (None, 0)
-                or data.get("status") not in ("QUEUED", "SENT", "DELIVERED", "READ")
+                or data.get("status") in ("ERROR", "DECLINED")
             ):
                 raise RuntimeError("Sendblue did not confirm acceptance; inspect provider status before retrying")
 

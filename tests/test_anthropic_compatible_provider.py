@@ -21,6 +21,24 @@ def _make_message(text: str = "Hi!", model: str = "claude-x") -> Message:
     )
 
 
+def _final_stream(message: Message) -> MagicMock:
+    """A `messages.stream()` context manager whose final message is `message`."""
+    stream = MagicMock()
+    stream.get_final_message = AsyncMock(return_value=message)
+    cm = MagicMock()
+    cm.__aenter__ = AsyncMock(return_value=stream)
+    cm.__aexit__ = AsyncMock(return_value=False)
+    return cm
+
+
+def _failing_stream(err: Exception) -> MagicMock:
+    """A `messages.stream()` context manager that fails when the request is sent."""
+    cm = MagicMock()
+    cm.__aenter__ = AsyncMock(side_effect=err)
+    cm.__aexit__ = AsyncMock(return_value=False)
+    return cm
+
+
 @pytest.fixture
 def anthropic_settings():
     from pincer.config import Settings
@@ -131,7 +149,7 @@ async def test_complete_returns_content(anthropic_settings):
 
     with patch(f"{MODULE}.AsyncAnthropic") as mock_cls:
         mock_client = MagicMock()
-        mock_client.messages.create = AsyncMock(return_value=_make_message("Hello!"))
+        mock_client.messages.stream = MagicMock(return_value=_final_stream(_make_message("Hello!")))
         mock_client.close = AsyncMock()
         mock_cls.return_value = mock_client
 
@@ -174,7 +192,7 @@ async def test_complete_parses_tool_use(anthropic_settings):
 
     with patch(f"{MODULE}.AsyncAnthropic") as mock_cls:
         mock_client = MagicMock()
-        mock_client.messages.create = AsyncMock(return_value=msg)
+        mock_client.messages.stream = MagicMock(return_value=_final_stream(msg))
         mock_cls.return_value = mock_client
 
         provider = AnthropicCompatibleProvider(anthropic_settings, "anthropic")
@@ -191,7 +209,7 @@ async def test_complete_passes_system_and_tools(anthropic_settings):
 
     with patch(f"{MODULE}.AsyncAnthropic") as mock_cls:
         mock_client = MagicMock()
-        mock_client.messages.create = AsyncMock(return_value=_make_message())
+        mock_client.messages.stream = MagicMock(return_value=_final_stream(_make_message()))
         mock_cls.return_value = mock_client
 
         provider = AnthropicCompatibleProvider(anthropic_settings, "anthropic")
@@ -202,7 +220,7 @@ async def test_complete_passes_system_and_tools(anthropic_settings):
             system="be nice",
         )
 
-    kwargs = mock_client.messages.create.call_args.kwargs
+    kwargs = mock_client.messages.stream.call_args.kwargs
     assert kwargs["system"] == "be nice"
     # tools pass through with the Sprint-5 cache breakpoint on the last one
     sent = kwargs["tools"]
@@ -221,7 +239,7 @@ async def test_complete_wraps_status_error(anthropic_settings):
 
     with patch(f"{MODULE}.AsyncAnthropic") as mock_cls:
         mock_client = MagicMock()
-        mock_client.messages.create = AsyncMock(side_effect=err)
+        mock_client.messages.stream = MagicMock(return_value=_failing_stream(err))
         mock_cls.return_value = mock_client
 
         provider = AnthropicCompatibleProvider(anthropic_settings, "anthropic")
@@ -236,7 +254,7 @@ async def test_convert_handles_images_tool_results(anthropic_settings):
 
     with patch(f"{MODULE}.AsyncAnthropic") as mock_cls:
         mock_client = MagicMock()
-        mock_client.messages.create = AsyncMock(return_value=_make_message())
+        mock_client.messages.stream = MagicMock(return_value=_final_stream(_make_message()))
         mock_cls.return_value = mock_client
 
         provider = AnthropicCompatibleProvider(anthropic_settings, "anthropic")
@@ -256,7 +274,7 @@ async def test_convert_handles_images_tool_results(anthropic_settings):
         ]
         await provider.complete(messages)
 
-    sent = mock_client.messages.create.call_args.kwargs["messages"]
+    sent = mock_client.messages.stream.call_args.kwargs["messages"]
     assert sent[0]["role"] == "user"  # first message must be user
 
 
@@ -290,11 +308,11 @@ async def test_complete_retries_then_succeeds(anthropic_settings):
     from pincer.llm.anthropic_common import AnthropicCompatibleProvider
 
     rate_err = anthropic.RateLimitError("slow down", response=MagicMock(headers={"retry-after": "0"}), body={})
-    create = AsyncMock(side_effect=[rate_err, _make_message("after retry")])
+    create = MagicMock(side_effect=[_failing_stream(rate_err), _final_stream(_make_message("after retry"))])
 
     with patch(f"{MODULE}.AsyncAnthropic") as mock_cls, patch(f"{MODULE}.asyncio.sleep", new_callable=AsyncMock):
         mock_client = MagicMock()
-        mock_client.messages.create = create
+        mock_client.messages.stream = create
         mock_cls.return_value = mock_client
 
         provider = AnthropicCompatibleProvider(anthropic_settings, "anthropic")
@@ -302,6 +320,63 @@ async def test_complete_retries_then_succeeds(anthropic_settings):
 
     assert result.content == "after retry"
     assert create.call_count == 2
+
+
+@pytest.mark.asyncio
+async def test_complete_accepts_max_tokens_the_sdk_refuses_to_send_unstreamed(anthropic_settings):
+    """PINCER_MAX_TOKENS=32768: the real SDK raises "Streaming is required for
+    operations that may take longer than 10 minutes" on a non-streaming call."""
+    import json
+
+    import httpx
+    from anthropic import AsyncAnthropic
+
+    from pincer.llm.anthropic_common import AnthropicCompatibleProvider
+
+    events = [
+        {
+            "type": "message_start",
+            "message": {
+                "id": "msg_1",
+                "type": "message",
+                "role": "assistant",
+                "model": "claude-x",
+                "content": [],
+                "stop_reason": None,
+                "stop_sequence": None,
+                "usage": {"input_tokens": 10, "output_tokens": 0},
+            },
+        },
+        {"type": "content_block_start", "index": 0, "content_block": {"type": "text", "text": ""}},
+        {"type": "content_block_delta", "index": 0, "delta": {"type": "text_delta", "text": "Hello!"}},
+        {"type": "content_block_stop", "index": 0},
+        {
+            "type": "message_delta",
+            "delta": {"stop_reason": "end_turn", "stop_sequence": None},
+            "usage": {"output_tokens": 5},
+        },
+        {"type": "message_stop"},
+    ]
+    body = "".join(f"event: {e['type']}\ndata: {json.dumps(e)}\n\n" for e in events)
+    sent: list[dict] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        sent.append(json.loads(request.content))
+        return httpx.Response(200, headers={"content-type": "text/event-stream"}, content=body.encode())
+
+    provider = AnthropicCompatibleProvider(anthropic_settings, "anthropic")
+    await provider._client.close()
+    provider._client = AsyncAnthropic(
+        api_key="sk-ant-test", http_client=httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    )
+
+    result = await provider.complete([LLMMessage(role=MessageRole.USER, content="hi")], max_tokens=32768)
+    await provider.close()
+
+    assert result.content == "Hello!"
+    assert result.stop_reason == "end_turn"
+    assert sent[0]["max_tokens"] == 32768
+    assert sent[0]["stream"] is True
 
 
 @pytest.mark.asyncio
@@ -315,7 +390,7 @@ async def test_complete_rate_limit_exhausted(anthropic_settings):
 
     with patch(f"{MODULE}.AsyncAnthropic") as mock_cls, patch(f"{MODULE}.asyncio.sleep", new_callable=AsyncMock):
         mock_client = MagicMock()
-        mock_client.messages.create = AsyncMock(side_effect=rate_err)
+        mock_client.messages.stream = MagicMock(return_value=_failing_stream(rate_err))
         mock_cls.return_value = mock_client
 
         provider = AnthropicCompatibleProvider(anthropic_settings, "anthropic")
@@ -380,7 +455,7 @@ async def test_complete_connection_error(anthropic_settings):
 
     with patch(f"{MODULE}.AsyncAnthropic") as mock_cls:
         mock_client = MagicMock()
-        mock_client.messages.create = AsyncMock(side_effect=err)
+        mock_client.messages.stream = MagicMock(return_value=_failing_stream(err))
         mock_cls.return_value = mock_client
 
         provider = AnthropicCompatibleProvider(anthropic_settings, "anthropic")
@@ -395,7 +470,7 @@ async def test_validate_merges_and_drops_orphans(anthropic_settings):
 
     with patch(f"{MODULE}.AsyncAnthropic") as mock_cls:
         mock_client = MagicMock()
-        mock_client.messages.create = AsyncMock(return_value=_make_message())
+        mock_client.messages.stream = MagicMock(return_value=_final_stream(_make_message()))
         mock_cls.return_value = mock_client
 
         provider = AnthropicCompatibleProvider(anthropic_settings, "anthropic")
@@ -411,7 +486,7 @@ async def test_validate_merges_and_drops_orphans(anthropic_settings):
         ]
         await provider.complete(messages)
 
-    sent = mock_client.messages.create.call_args.kwargs["messages"]
+    sent = mock_client.messages.stream.call_args.kwargs["messages"]
     # the two consecutive user messages were merged into one
     assert sent[0]["role"] == "user"
     assert "one" in sent[0]["content"] and "two" in sent[0]["content"]
@@ -463,10 +538,71 @@ class TestToolPromptCaching:
     async def test_complete_sends_cached_tools(self, anthropic_settings):
         provider = self._provider(anthropic_settings)
         provider._client = MagicMock()
-        provider._client.messages.create = AsyncMock(return_value=_make_message())
+        provider._client.messages.stream = MagicMock(return_value=_final_stream(_make_message()))
         tools = [{"name": "a", "description": "x", "input_schema": {}}]
 
         await provider.complete([LLMMessage(role=MessageRole.USER, content="hi")], tools=tools)
 
-        sent_tools = provider._client.messages.create.call_args.kwargs["tools"]
+        sent_tools = provider._client.messages.stream.call_args.kwargs["tools"]
         assert sent_tools[-1]["cache_control"] == {"type": "ephemeral"}
+
+
+# ── Per-model request params: temperature only where the model accepts it ──
+
+
+class TestTemperatureByModel:
+    REJECTS = "claude-haiku-5-5"
+    ACCEPTS = "claude-haiku-4-5-20251001"
+
+    def _provider(self, settings):
+        from pincer.llm.anthropic_common import AnthropicCompatibleProvider
+
+        with patch(f"{MODULE}.AsyncAnthropic"):
+            provider = AnthropicCompatibleProvider(settings, "anthropic")
+
+        async def _text_stream():
+            yield "ok"
+
+        stream = MagicMock(text_stream=_text_stream())
+        stream.get_final_message = AsyncMock(return_value=_make_message())
+        stream_cm = MagicMock()
+        stream_cm.__aenter__ = AsyncMock(return_value=stream)
+        stream_cm.__aexit__ = AsyncMock(return_value=False)
+
+        provider._client = MagicMock()
+        provider._client.messages.stream = MagicMock(return_value=stream_cm)
+        return provider
+
+    async def _sent_kwargs(self, provider, method, **call_kwargs):
+        messages = [LLMMessage(role=MessageRole.USER, content="hi")]
+        if method == "complete":
+            await provider.complete(messages, **call_kwargs)
+            return provider._client.messages.stream.call_args.kwargs
+        _ = [e async for e in getattr(provider, method)(messages, **call_kwargs)]
+        return provider._client.messages.stream.call_args.kwargs
+
+    @pytest.mark.parametrize("method", ["complete", "stream", "stream_turn"])
+    async def test_dropped_for_model_that_rejects_it(self, anthropic_settings, method):
+        provider = self._provider(anthropic_settings)
+        kwargs = await self._sent_kwargs(provider, method, model=self.REJECTS, temperature=0, max_tokens=150)
+        assert "temperature" not in kwargs
+        assert kwargs["model"] == self.REJECTS
+        assert kwargs["max_tokens"] == 150
+
+    @pytest.mark.parametrize("method", ["complete", "stream", "stream_turn"])
+    async def test_sent_for_model_that_accepts_it(self, anthropic_settings, method):
+        provider = self._provider(anthropic_settings)
+        kwargs = await self._sent_kwargs(provider, method, model=self.ACCEPTS, temperature=0)
+        assert kwargs["temperature"] == 0  # an explicit 0 is not replaced by the default
+
+    @pytest.mark.parametrize("method", ["complete", "stream", "stream_turn"])
+    async def test_default_model_and_temperature(self, anthropic_settings, method):
+        """No per-call model: the rule applies to the provider's default model."""
+        anthropic_settings.anthropic_model = self.REJECTS
+        provider = self._provider(anthropic_settings)
+        assert "temperature" not in await self._sent_kwargs(provider, method)
+
+        anthropic_settings.anthropic_model = self.ACCEPTS
+        provider = self._provider(anthropic_settings)
+        kwargs = await self._sent_kwargs(provider, method)
+        assert kwargs["temperature"] == anthropic_settings.temperature

@@ -41,6 +41,11 @@ pincer
 │   └── setup               # Interactive Slack bot token setup (71 tools)
 ├── whatsapp
 │   └── setup               # Pair WhatsApp via QR code
+├── identity
+│   ├── list                # Identities, emails, channels, credentials
+│   ├── create <name>       # Create an identity with a password or an API key
+│   ├── set-password <name> # Set or reset the dashboard/API password
+│   └── api-key <name>      # Generate an API key (printed once)
 ├── audit                   # View audit logs (options, not subcommands)
 ├── mcp
 │   ├── list                # MCP servers + connection status
@@ -297,7 +302,7 @@ Running 25+ security checks...
   🟢 telegram_allowlist: Configured (1 users)
   🟡 discord_allowlist: No guild allowlist
      → Set PINCER_DISCORD_GUILD_ALLOWLIST
-  🟢 dashboard_auth_token: Configured (16+ chars)
+  🟢 dashboard_auth_token: 1 identity can sign in to the API
 
 💰 Budget & Limits
   🟢 budget_limits: Daily budget: $5.00
@@ -378,6 +383,51 @@ pincer whatsapp setup
 
 ---
 
+### `pincer identity`
+
+Manage who can sign in to the REST API and the dashboard. An identity signs in
+with a password (dashboard) or an API key (headless consumers such as the web
+chat widget). There are no roles: any identity with a password or a key has
+full API access.
+
+```bash
+pincer identity list
+pincer identity create <name> [password] [--api-key] [--email EMAIL] [--display-name NAME]
+pincer identity set-password <name> [password]
+pincer identity api-key <name> [--force]
+pincer identity revoke <name>
+```
+
+| Command | Description |
+|---------|-------------|
+| `list` | Identities with email, channels, whether a password is set, and the masked API key |
+| `create` | Create an identity together with what it signs in with: a password (omit it to be prompted, hidden and confirmed), or with `--api-key` an API key that is printed once. Names are letters, digits and underscores; `me` and names starting with `usr_` are reserved. `--email` can also be used to sign in |
+| `set-password` | Reset a password, or give one to an identity that has none (8–256 characters). Omit the password to be prompted (hidden, confirmed) — this keeps it out of the shell history. Signs the identity out everywhere |
+| `api-key` | Generate an API key (`pnc_…`). It is printed once; only a masked form (`pnc_Ab3d…wxyz`) is shown afterwards. `--force` replaces an existing key, and the old one stops working immediately |
+| `revoke` | Remove the identity's password and API key and end its sessions. The identity, its channels and its history stay |
+
+**Examples:**
+```bash
+# First sign-in after install (prompts for the password)
+pincer identity create alice --email alice@example.com
+
+# Key for the web chat widget
+pincer identity api-key alice
+
+# A key-only identity
+pincer identity create widget --api-key
+```
+
+`pincer doctor` warns while no identity has a password or a key.
+
+**Identity map:** when an identity map (`PINCER_IDENTITY_MAP` or `[identity]`
+in `pincer.toml`) is configured, identities without a channel link are deleted
+at startup — unless they hold a password or an API key, so a dashboard-only or
+service identity survives. Removing someone from the map does not revoke their
+API access; use `pincer identity revoke <name>`.
+
+---
+
 ### `pincer audit`
 
 View security audit log entries.
@@ -427,11 +477,16 @@ Total: 1,247 entries | Cost: $2.4510 | Failed: 3
 
 ### Skills
 
-There is no `pincer skills` CLI command group. Skills are discovered purely from
-the filesystem: drop a directory containing a `SKILL.md` file into
-`src/pincer/skills/` (bundled, shipped inside the package) or `~/.pincer/skills/`
-(user) and restart Pincer. See the
-[Skills Guide](../guides/skills-guide.md) for the format and the
+Skills are discovered from their roots: `src/pincer/skills/` (bundled, shipped
+inside the package) and `skills_dir` (user — `~/.pincer/skills/` by default, or an
+`s3://` / `az://` / `gs://` prefix). There is no install step.
+
+| Command | What it does |
+|---|---|
+| `pincer skills rebuild` | Clear cached remote skill files, rescan both roots, and make a running `pincer run` reload: the dashboard on its next request, the agent within `skills_index_watch_interval_seconds` (5 min by default) |
+| `pincer skills rebuild --keep-cache` | Same, but keep cloudpathlib's cached copies of remote files |
+
+See the [Skills Guide](../guides/skills-guide.md) for the format and the
 `load_skill` / `load_skill_reference` / `run_skill_script` tools the agent
 uses to read and act on them.
 
@@ -715,7 +770,12 @@ See [Background Tasks](background-tasks.md) for the full architecture.
 ### Security
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `PINCER_DASHBOARD_TOKEN` | | API auth token (32+ chars) |
+| `PINCER_JWT_SECRET` | (generated) | Signs session tokens; min 32 chars. Unset = generated once into `<data_dir>/jwt_secret` |
+| `PINCER_JWT_ACCESS_TTL_SECONDS` | `1800` | Access token lifetime |
+| `PINCER_JWT_REFRESH_TTL_SECONDS` | `604800` | Refresh token lifetime |
+| `PINCER_AUTH_DISABLED` | `false` | Serve `/api/*` without authentication (local dev/tests only) |
+| `PINCER_AUTH_MAX_FAILURES` | `10` | Failed attempts per IP (and per account on login) before lockout |
+| `PINCER_AUTH_LOCKOUT_SECONDS` | `300` | Base lockout window; doubles per further failure (max 1h) |
 | `PINCER_DASHBOARD_HOST` | `127.0.0.1` | API bind address |
 | `PINCER_DASHBOARD_PORT` | `8080` | API port |
 | `PINCER_DASHBOARD_URL` | | External URL for CORS |

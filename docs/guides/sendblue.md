@@ -10,7 +10,7 @@ Install `pip install 'pincer-agent[sendblue]'` (or `uv sync --extra sendblue --e
 from source). Configure an LLM provider using Pincer's normal setup first; Sendblue
 credentials provide messaging, not model access.
 
-For a new free agent account, install Node.js and run:
+For CLI account verification, install Node.js and run:
 
 ```sh
 npx -y @sendblue/cli@0.10.0 setup --phone +YOUR_PERSONAL_PHONE
@@ -21,6 +21,10 @@ Send the displayed verification text from that phone, then run
 pending. Credentials are saved to `~/.sendblue/credentials.json` when it completes.
 Your personal phone is the recipient; `assignedNumber` is the sending line. Existing
 accounts can use their API credentials and an assigned Sendblue line instead.
+
+Confirm that your account enables receive webhooks and agent replies before continuing.
+Sendblue's public pricing and quickstart have described different free-plan entitlements;
+phone verification alone does not prove this integration is enabled for your account.
 
 Set these variables in the same shell that runs Pincer (the commands below use `jq`):
 
@@ -36,14 +40,24 @@ pincer run
 
 Keep the same signing secret across restarts and store credentials in your secret
 manager or Pincer's local `.env` (never commit it). All phone numbers must use E.164
-format, such as `+15555550101`. An empty allowlist denies all senders; `["*"]` explicitly
+format, such as `+15555550101`. `PINCER_SENDBLUE_ALLOW_FROM` accepts a JSON array,
+comma-separated numbers, or a blank value. An empty allowlist denies all senders; `["*"]` explicitly
 allows any sender. A configured Pincer identity map is an additional inbound gate:
-add the sender as `sendblue:+15555550101` using the normal identity setup.
+add the sender as `sendblue:15555550101` (a leading `+` also works) using normal
+identity setup. The provider always receives an E.164 number with `+`.
 
-The adapter binds `127.0.0.1:8787` by default. Expose **only**
-`POST /webhooks/sendblue` through a public HTTPS reverse proxy or tunnel. Set
-`PINCER_SENDBLUE_WEBHOOK_HOST=0.0.0.0` when your container deployment requires it;
-`PINCER_SENDBLUE_WEBHOOK_PORT` changes the port.
+The webhook shares Pincer's existing API listener, normally `127.0.0.1:8080`.
+Expose **only** `POST /api/apps/sendblue/webhook` through your HTTPS reverse proxy
+or tunnel. Use `PINCER_DASHBOARD_HOST` and `PINCER_DASHBOARD_PORT` for the shared
+listener. This route uses `sb-signing-secret` instead of a dashboard Bearer token;
+other API routes retain their normal authentication. There is no second listener
+or additional Sendblue SDK dependency. If upgrading this PR's earlier implementation,
+replace the old port-8787 `/webhooks/sendblue` URL; the old
+`PINCER_SENDBLUE_WEBHOOK_HOST/PORT` settings are no longer used.
+
+Run `pincer doctor` to check credentials, the assigned line, sender permissions and
+public binding. Authenticated `GET /api/status` reports whether the Sendblue channel
+is running. Invalid channel configuration reports a specific safe startup warning.
 
 ## Register incoming messages
 
@@ -52,7 +66,7 @@ Replace the URL with your public HTTPS endpoint. POST appends; do not replace
 other account webhooks with PUT.
 
 ```sh
-export SENDBLUE_WEBHOOK_URL='https://YOUR_HOST/webhooks/sendblue'
+export SENDBLUE_WEBHOOK_URL='https://YOUR_HOST/api/apps/sendblue/webhook'
 jq -n --arg url "$SENDBLUE_WEBHOOK_URL" \
   --arg secret "$PINCER_SENDBLUE_SIGNING_SECRET" \
   --arg line "$PINCER_SENDBLUE_FROM_NUMBER" \
@@ -87,17 +101,24 @@ allowlist/identity mapping, model credentials and free-plan contact verification
   notice; files are not downloaded. Group messages, outbound echoes and status callbacks
   are ignored. File uploads fail explicitly. URLs can be sent as plain text.
 - Tool approval and interactive `ask_user` prompts are not implemented for this channel;
-  approval-required tools are denied by Pincer's existing gate. Use a channel with an
+  approval-required tools are denied on Sendblue. Enabling Sendblue preserves the
+  existing approval policy for other channels and the embedded MCP server. Use a channel with an
   approval interface for those operations.
-- The inbox holds 128 messages, processed sequentially. HTTP 200 means accepted into
-  memory. A full inbox returns 503. Up to 4096 accepted message handles are deduplicated
+- At most 128 messages may be queued or in flight, with up to eight concurrent turns.
+  Messages from one sender remain ordered; a slow sender does not block other senders.
+  HTTP 200 means accepted into memory. A full inbox returns 503. Up to 4096 accepted message handles are deduplicated
   in memory; restart or eviction clears that protection. This is not a durable inbox.
 - Replies split into 2000-character chunks. Ambiguous network failures are not retried
   automatically because a retry can send the same message twice. Earlier chunks can
   have been accepted. Inspect Sendblue before manually retrying.
-- Processing failures are logged with the incoming message handle, without payloads or
-  secrets. Accepted messages are not replayed automatically; ask the sender to resend
-  after resolving the problem. Shutdown drains the inbox for up to 30 seconds.
+- Processing failures log the stage, exception type and escaped incoming handle, without
+  exception text, payloads or secrets. A handler failure before a reply is sent triggers
+  one best-effort failure notice. A failed/ambiguous outbound send triggers no extra POST.
+  Accepted messages are not replayed automatically. Shutdown closes admission and cancels
+  in-flight/queued work before dependencies are stopped; in-memory messages may be lost.
+- Responses with a valid provider handle and no explicit `ERROR`/`DECLINED` status or
+  nonzero error code count as accepted, including `REGISTERED`, `PENDING`, and `ACCEPTED`.
+  This allows later chunks to proceed, but does not claim delivery to the handset.
 
 Provider reference: [credentials](https://docs.sendblue.com/getting-started/credentials),
 [webhooks](https://docs.sendblue.com/api/resources/webhooks),

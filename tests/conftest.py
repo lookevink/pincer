@@ -1,7 +1,9 @@
 """Shared test fixtures."""
 
+import asyncio
 import os
-from collections.abc import Iterator
+from collections.abc import Awaitable, Callable, Iterator
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 from unittest.mock import AsyncMock
@@ -14,6 +16,9 @@ os.environ["PINCER_ANTHROPIC_API_KEY"] = "sk-ant-test-key"
 os.environ["PINCER_TELEGRAM_BOT_TOKEN"] = "123456:TEST"
 os.environ["PINCER_DATA_DIR"] = "/tmp/pincer-test"
 os.environ["PINCER_DAILY_BUDGET_USD"] = "100.0"
+# The API is default-deny. Tests that exercise a route rather than its auth run
+# with it switched off; the ones about auth use the `authed_app` fixture.
+os.environ["PINCER_AUTH_DISABLED"] = "true"
 
 from pincer.config import Settings
 from pincer.config.database import DatabaseSettings
@@ -46,6 +51,17 @@ def _isolate_dotenv(monkeypatch: pytest.MonkeyPatch) -> None:
     # ...and stop it doing so in the first place: without this the MCP config
     # tests leave the developer's LLM provider settings behind for later ones.
     monkeypatch.setattr("pincer.mcp.config._DOTENV_CANDIDATES", ())
+
+
+@pytest.fixture(autouse=True)
+def _reset_skill_service() -> Iterator[None]:
+    """The SkillService is a per-process singleton built from the first settings
+    that ask for it; a test's mocked settings must not leak into the next test."""
+    from pincer.services.skills import reset_skill_service
+
+    reset_skill_service()
+    yield
+    reset_skill_service()
 
 
 @pytest.fixture(autouse=True)
@@ -266,6 +282,145 @@ def mock_agent():
     return agent
 
 
+# ── API auth ─────────────────────────────────────────────────────────
+
+
+@dataclass
+class AuthedApp:
+    """The API with authentication on, and one identity that can sign in."""
+
+    client: Any  # fastapi.testclient.TestClient
+    db_url: str
+    user_id: str
+    email: str
+    password: str
+    access_token: str
+    refresh_token: str
+    api_key: str
+
+    @property
+    def jwt_headers(self) -> dict[str, str]:
+        return {"Authorization": f"Bearer {self.access_token}"}
+
+    @property
+    def api_key_headers(self) -> dict[str, str]:
+        return {"Authorization": f"Bearer {self.api_key}"}
+
+    @property
+    def auth(self) -> Any:
+        from pincer.services.auth import build_auth_service
+
+        return build_auth_service()
+
+    @property
+    def identities(self) -> Any:
+        from pincer.services.identity import IdentityService
+
+        return IdentityService(self.db_url)
+
+    def listen_ticket(self, call_sid: str) -> str:
+        """A listen-in ticket for the seeded session, as the ticket route mints it."""
+        auth = self.auth
+
+        async def issue() -> str:
+            return await auth.issue_ws_ticket(await auth.authenticate_bearer(self.access_token), call_sid)
+
+        return self.run(issue)
+
+    @staticmethod
+    def run[T](make: Callable[[], Awaitable[T]]) -> T:
+        """Run a service call from a sync test, on a loop of its own.
+
+        The TestClient serves requests on another loop, and engines are per
+        loop, so this one's are disposed before it closes.
+        """
+        from pincer.db.engine import dispose_engines
+
+        async def main() -> T:
+            try:
+                return await make()
+            finally:
+                await dispose_engines()
+
+        return asyncio.run(main())
+
+
+def seed_identity_with_api_key(db_path: Path, name: str = "alice") -> None:
+    """Give the database at `db_path` one identity that can authenticate.
+
+    For the health checks (`pincer doctor`, the pilot preflight), which only
+    ask whether anybody can sign in. An API key rather than a password: no
+    Argon2, and no JWT secret is involved.
+    """
+    from pincer.db.engine import ensure_schema_current, get_database_url
+    from pincer.services.auth import AuthService
+    from pincer.services.identity import IdentityService
+
+    ensure_schema_current(db_path)
+    url = get_database_url(db_path)
+
+    async def seed() -> None:
+        await IdentityService(url).create_profile(name)
+        await AuthService(url, jwt_secret="unused-" + "x" * 32).generate_api_key(name)
+
+    AuthedApp.run(seed)
+
+
+@pytest.fixture
+def authed_app(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Iterator[AuthedApp]:
+    """`create_app()` with real authentication and a seeded identity.
+
+    Yields the client together with a valid access token, refresh token and
+    API key for `alice`, so a test can pick the caller it needs. Every other
+    API test runs with `PINCER_AUTH_DISABLED=true` (set at the top of this
+    file).
+    """
+    from argon2 import PasswordHasher
+    from fastapi.testclient import TestClient
+
+    from pincer.api.server import create_app
+    from pincer.config import get_settings_relaxed
+    from pincer.db.engine import ensure_schema_current, get_database_url
+    from pincer.security import credentials
+
+    # Argon2's real parameters cost ~50 ms and 64 MiB a hash; what is under
+    # test here is who gets in, not how hard the hash is.
+    monkeypatch.setattr(credentials, "_hasher", PasswordHasher(time_cost=1, memory_cost=8, parallelism=1))
+    credentials._dummy_hash.cache_clear()
+
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("PINCER_DATA_DIR", str(tmp_path))
+    monkeypatch.setenv("PINCER_AUTH_DISABLED", "false")
+    monkeypatch.setenv("PINCER_JWT_SECRET", "j" * 48)
+    get_settings_relaxed.cache_clear()
+
+    db_path = tmp_path / "pincer.db"
+    ensure_schema_current(db_path)
+    seeded = AuthedApp(
+        client=None,
+        db_url=get_database_url(db_path),
+        user_id="alice",
+        email="alice@example.com",
+        password="correct horse battery",
+        access_token="",
+        refresh_token="",
+        api_key="",
+    )
+
+    async def seed() -> None:
+        await seeded.identities.create_profile(seeded.user_id, email=seeded.email, display_name="Alice")
+        await seeded.auth.set_password(seeded.user_id, seeded.password)
+        seeded.api_key, _ = await seeded.auth.generate_api_key(seeded.user_id)
+        pair = await seeded.auth.login(seeded.user_id, seeded.password)
+        seeded.access_token, seeded.refresh_token = pair.access_token, pair.refresh_token
+
+    AuthedApp.run(seed)
+    seeded.client = TestClient(create_app())
+    yield seeded
+    get_settings_relaxed.cache_clear()
+    credentials._dummy_hash.cache_clear()
+
+
 # ── SQLModel layer ───────────────────────────────────────────────────
 
 
@@ -382,3 +537,101 @@ async def migrated_url(migration_url: str, tmp_path: Path):
     await asyncio.to_thread(command.upgrade, config, "head")
     yield to_async_url(migration_url)
     await dispose_engines()
+
+
+# ── Skill roots (local + offline cloud mocks) ────────────────────────
+
+# A dummy connection string: cloudpathlib's Azure mock refuses anonymous
+# clients but never connects anywhere.
+_FAKE_AZURE_CONNECTION_STRING = (
+    "DefaultEndpointsProtocol=https;AccountName=pincertest;AccountKey=dGVzdA==;EndpointSuffix=core.windows.net"
+)
+
+
+class SkillRoots:
+    """What the `skill_root` fixture returns: `roots("bundled")` gives a root.
+
+    `roots.external("bundled")` is the same location reached through a second
+    client that shares the simulated bucket but has its own file cache — a write
+    there changes the object *behind* the first client's cache, like an upload
+    from another machine. (A write through the first client also updates its own
+    cached copy, so it can't show whether a cache refresh happened.) For local
+    roots both are the same directory.
+    """
+
+    def __init__(self, make: Callable[[str], Any], make_external: Callable[[str], Any]) -> None:
+        self._make = make
+        self._make_external = make_external
+
+    def __call__(self, name: str) -> Any:
+        return self._make(name)
+
+    def external(self, name: str) -> Any:
+        return self._make_external(name)
+
+
+@pytest.fixture(params=["local", "s3", "azure", "gs"])
+def skill_root(request: pytest.FixtureRequest, tmp_path: Path) -> SkillRoots:
+    """Factory for skill roots on every storage backend: `skill_root("bundled")`.
+
+    `local` returns a plain directory under tmp_path; the cloud params return
+    CloudPaths from cloudpathlib's offline mock clients, whose simulated bucket
+    and file cache also live under tmp_path, so nothing is shared between
+    tests and no network is touched. Write skills through the path API
+    (`write_text`, `unlink`), which works the same on every backend. See
+    `SkillRoots.external` for changing objects behind the cache.
+    """
+    backend = request.param
+    if backend == "local":
+        return SkillRoots(lambda name: tmp_path / name, lambda name: tmp_path / name)
+
+    local = pytest.importorskip("cloudpathlib.local")
+    storage = tmp_path / f"{backend}-storage"
+
+    def make_client(cache: Path) -> Any:
+        if backend == "s3":
+            return local.LocalS3Client(local_storage_dir=storage, local_cache_dir=cache)
+        if backend == "azure":
+            return local.LocalAzureBlobClient(
+                local_storage_dir=storage, local_cache_dir=cache, connection_string=_FAKE_AZURE_CONNECTION_STRING
+            )
+        return local.LocalGSClient(local_storage_dir=storage, local_cache_dir=cache)
+
+    prefix = {"s3": "s3://skills-bucket", "azure": "az://skills-container", "gs": "gs://skills-bucket"}[backend]
+    client = make_client(tmp_path / f"{backend}-cache")
+    external_client = make_client(tmp_path / f"{backend}-external-cache")
+    return SkillRoots(
+        lambda name: client.CloudPath(f"{prefix}/{name}"),
+        lambda name: external_client.CloudPath(f"{prefix}/{name}"),
+    )
+
+
+# ── Real Pincer processes (daemon, `pincer run`) ─────────────────────
+
+
+@pytest.fixture
+def signal_stub() -> Iterator[str]:
+    """Answers the Signal channel's health check and polls (with 404s, which it only warns about)."""
+    import http.server
+    import threading
+
+    server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), http.server.BaseHTTPRequestHandler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    yield f"http://127.0.0.1:{server.server_address[1]}"
+    server.shutdown()
+    server.server_close()
+
+
+@pytest.fixture
+def redis_url() -> str:
+    """A Redis for the task worker's broker, if one is configured.
+
+    Opt-in, like `PINCER_TEST_PG_URL`; locally, e.g.
+    `docker run -d --rm --name pincer-tasks-redis-test -p 127.0.0.1:16389:6379 redis:7-alpine` and
+    `PINCER_TEST_REDIS_URL=redis://127.0.0.1:16389/0`.
+    """
+    url = os.environ.get("PINCER_TEST_REDIS_URL")
+    if not url:
+        pytest.skip("PINCER_TEST_REDIS_URL not set")
+    return url

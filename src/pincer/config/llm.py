@@ -27,7 +27,10 @@ class LLMSettings(BaseModel):
     )
     summary_provider: str | None = Field(
         default=None,
-        description="Provider used by the Summarizer; defaults to the primary",
+        description=(
+            "Provider used by the Summarizer; defaults to the primary. Built on demand from its "
+            "credentials when it is not in the failover pool"
+        ),
     )
 
     # Well-known providers — set the key, base URL is built in.
@@ -74,7 +77,7 @@ class LLMSettings(BaseModel):
         return v
 
     default_model: str = Field(
-        default="claude-sonnet-4-5-20250929",
+        default="claude-haiku-4-5-20251001",
         description="Default model identifier",
     )
     prompt_cache_tools: bool = Field(

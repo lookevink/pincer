@@ -10,11 +10,143 @@ Pincer exposes a REST API via its dashboard server for monitoring and management
 http://localhost:8080/api
 ```
 
-All endpoints require the dashboard auth token:
+Every `/api/*` route except `GET /api/health`, `POST /api/auth/login` and
+`POST /api/auth/refresh` requires an authenticated identity — see
+[Authentication](#authentication).
+
+---
+
+## Authentication
+
+The API authenticates **identities**. There is no shared token and there are
+no roles: any identity with a password or an API key has full API access.
+Create identities and credentials with the
+[`pincer identity`](cli.md#identity-api-access) commands.
+
+Send one of two credentials as a Bearer value:
 
 ```
-Authorization: Bearer <PINCER_DASHBOARD_TOKEN>
+Authorization: Bearer <access token or API key>
 ```
+
+| Credential | For | How to get it |
+|---|---|---|
+| Access token (JWT) | The dashboard and other interactive sessions | `POST /api/auth/login`; lives 30 min (`PINCER_JWT_ACCESS_TTL_SECONDS`), renewed with the refresh token (7 days, `PINCER_JWT_REFRESH_TTL_SECONDS`) |
+| API key (`pnc_…`) | Headless consumers, e.g. the web chat widget | `pincer identity api-key <name>` or `POST /api/identity/me/api-key`; shown in full once |
+
+| Route | Auth | Purpose |
+|---|---|---|
+| `POST /api/auth/login` | public | Exchange name or email + password for a token pair |
+| `POST /api/auth/refresh` | public | Exchange a refresh token for a new token pair |
+| `POST /api/auth/logout` | any | End the caller's session |
+| `GET /api/identity/me` | any | The caller's identity |
+| `PUT /api/identity/me/password` | session (JWT) | Change the caller's password |
+| `GET /api/identity/me/api-key` | any | Whether the caller has an API key (masked) |
+| `POST /api/identity/me/api-key?force=` | session (JWT) | Generate or replace the caller's API key |
+| `POST /api/voice/listen/{call_sid}/ticket` | session (JWT) | One-minute ticket for the [listen-in WebSocket](#websocket) |
+
+"session (JWT)" routes need an access token; an API-key caller gets `403`.
+
+`PINCER_AUTH_DISABLED=true` serves `/api/*` without authentication. It is for
+local development and tests only — `pincer doctor --production` reports it
+CRITICAL.
+
+### `POST /api/auth/login`
+
+```json
+{ "identifier": "alice", "password": "…" }
+```
+
+`identifier` is matched against the exact identity name first, then against
+the email address (case-insensitive). An email shared by several identities
+cannot be used to sign in.
+
+```json
+{
+  "access_token": "eyJ…",
+  "refresh_token": "eyJ…",
+  "token_type": "bearer",
+  "expires_in": 1800,
+  "pincer_user_id": "alice"
+}
+```
+
+### `POST /api/auth/refresh`
+
+```json
+{ "refresh_token": "eyJ…" }
+```
+
+Returns a new token pair in the same shape as login. The refresh token is
+single-use: store the new one. Presenting a refresh token that was already
+replaced ends the session (`401 token_expired`). The exception is the 30
+seconds after a refresh: the token it replaced is then still answered, with
+the same refresh token the first caller received, so two tabs refreshing at
+once both end up holding the current one.
+
+### `POST /api/auth/logout`
+
+`204`. Ends the session the access token belongs to: its access and refresh
+tokens stop working immediately. Other sessions of the same identity and its
+API key are unaffected (a no-op when called with an API key).
+
+### `GET /api/identity/me`
+
+The caller's identity, plus `auth_method`: `jwt` or `api_key`.
+
+### `PUT /api/identity/me/password`
+
+```json
+{ "current_password": "…", "new_password": "…" }
+```
+
+Passwords are 8–256 characters. Returns a fresh token pair; `403` if the
+current password is wrong. Changing a password invalidates every token issued
+before it. API keys are unaffected.
+
+### `GET /api/identity/me/api-key`
+
+```json
+{ "exists": true, "masked": "pnc_Ab3d…wxyz", "created_at": "2026-02-26T10:00:00Z" }
+```
+
+### `POST /api/identity/me/api-key?force=true`
+
+`201` with the key — the only time it is returned in full (only its SHA-256 is
+stored):
+
+```json
+{ "api_key": "pnc_…", "masked": "pnc_Ab3d…wxyz", "created_at": "2026-02-26T10:00:00Z" }
+```
+
+`409` if a key already exists and `force` is not set. Replacing a key stops
+the old one working immediately.
+
+### Errors
+
+Authentication failures return `{"error": "<code>", "detail": "…"}`:
+
+| Code | Status | Meaning |
+|---|---|---|
+| `invalid_credentials` | 401 | Login failed — the same response for an unknown user and a wrong password |
+| `invalid_token` | 401 | The Bearer value is not a valid access token or API key |
+| `token_expired` | 401 | The token expired, its session was signed out, or it was issued before a password change; refresh or sign in again. Does not count toward the lockout |
+| `locked_out` | 429 | Too many failures; retry after the `Retry-After` header |
+
+Failures are counted per IP, and on login also per account
+(`PINCER_AUTH_MAX_FAILURES`, `PINCER_AUTH_LOCKOUT_SECONDS`). An identity has
+one account budget whether it is named by id or by email. The per-IP lockout
+doubles with each further failure; the per-account one is a flat window, since
+anyone can spend another person's budget.
+
+### Chat routes and `X-Pincer-User`
+
+On `/api/chat/*` the user depends on the credential:
+
+- **Access token** — the signed-in identity; `X-Pincer-User` is ignored.
+- **API key** — `X-Pincer-User` (a UUID) is the visitor-session id. It is
+  optional: without it the key's own identity is used.
+- **Auth disabled** — `X-Pincer-User` is required.
 
 ---
 
@@ -22,12 +154,14 @@ Authorization: Bearer <PINCER_DASHBOARD_TOKEN>
 
 ### `GET /health`
 
-No auth required. Returns agent status.
+No auth required. Returns agent status. `auth_required` is `false` only when
+`PINCER_AUTH_DISABLED` is set.
 
 ```json
 {
   "status": "ok",
   "version": "0.7.0",
+  "auth_required": true,
   "uptime_seconds": 86400,
   "channels": {
     "telegram": "connected",
@@ -224,7 +358,7 @@ List extracted entities. Types: `person`, `place`, `project`, `organization`.
 
 ### `GET /api/skills`
 
-List discovered `SKILL.md` skills — bundled (shipped inside the package at `src/pincer/skills/`) and user (`~/.pincer/skills/`), listed uniformly. Read-only — there is no install/scan/delete API; skills are added by placing a directory under `~/.pincer/skills/` and restarting. See the [Skills Guide](../guides/skills-guide.md).
+List discovered `SKILL.md` skills — bundled (shipped inside the package at `src/pincer/skills/`) and user (`skills_dir`: `~/.pincer/skills/` or an `s3://` / `az://` / `gs://` prefix), listed uniformly. There is no install/delete API; add a skill directory to the user root, then call `POST /api/skills/rebuild` (or `pincer skills rebuild`). See the [Skills Guide](../guides/skills-guide.md).
 
 ```json
 {
@@ -234,9 +368,32 @@ List discovered `SKILL.md` skills — bundled (shipped inside the package at `sr
       "description": "How to write a new Pincer skill as a SKILL.md directory...",
       "status": "active",
       "source": "file",
-      "root": "bundled"
+      "root": "bundled",
+      "dir": "skill-authoring"
     }
   ]
+}
+```
+
+### `POST /api/skills/rebuild`
+
+Rebuild the skill index — the API counterpart of `pincer skills rebuild`. Query parameter `keep_cache` (default `false`) keeps cloudpathlib's cached copies of remote skill files instead of re-fetching them.
+
+1. Rebuilds the index of the process serving the request first, so the agent and dashboard it serves already see the result when the response returns.
+2. Queues one `rebuild_skill_index` background job carrying the new `generation`.
+
+The job is consumed by **one** process: with `task_broker=redis` that is any `pincer run tasks` worker, or the main `pincer run` itself, where it is a no-op. Workers that share the main process's data volume (the default `docker-compose.yml` setup) also follow the generation stamp the rebuild wrote; the job is what reaches a worker that doesn't. The job is idempotent and never moves a process to an older generation: a process already at that generation (or a newer one) skips it. The job carries the sender's disk ID (a file in `skills_cache_dir`), so a worker on the same data volume only catches up with the stamp instead of clearing the shared cache a second time.
+
+A failed enqueue doesn't fail the request — the in-app rebuild has already happened — and is reported in `job`. If a skill root can't be listed (an outage, expired credentials) the response is `503`, and nothing changes: the index keeps its previous skills and no generation is announced. A single skill whose SKILL.md can't be read doesn't fail the rebuild: it's skipped (local root), or keeps its previous version (cloud root), with a warning in the log. Any other failed rebuild is a `500`.
+
+`generation` is opaque, but it sorts by creation time: it has the form `<time_ns, 20 digits>-<uuid hex>`. A process never moves to a generation that sorts before its current one.
+
+```json
+{
+  "generation": "01760000000000000000-3f1c9e4a7b2d4e0f9a8c6b5d4e3f2a1b",
+  "cache_cleared": true,
+  "skills": [{"name": "skill-authoring", "root": "bundled", "dir": "skill-authoring", "...": "..."}],
+  "job": {"queued": true, "topic": "rebuild_skill_index"}
 }
 ```
 
@@ -407,14 +564,27 @@ post-call follow-up suggestion.
 
 ## WebSocket
 
-### `WS /ws`
+### `WS /api/voice/listen/{call_sid}`
 
-Real-time event stream. Connect for live updates:
+Live listen-in audio for an active call (requires
+`PINCER_LISTEN_IN_ENABLED=true`; see
+[Voice calling → Live listen-in](../core-components/voice-calling.md#live-listen-in-sprint-15)
+for the wire protocol).
+
+Browsers cannot set a header on a WebSocket, so they first request a ticket
+with their access token and pass it in the query string. A ticket is valid for
+60 seconds, only for that call and for one connection, and stops working when
+the session that requested it signs out:
 
 ```javascript
-const ws = new WebSocket("ws://localhost:8080/ws?token=YOUR_TOKEN");
-ws.onmessage = (e) => {
-  const event = JSON.parse(e.data);
-  // event.type: "message", "tool_call", "cost_update", "channel_status"
-};
+const res = await fetch(`/api/voice/listen/${callSid}/ticket`, {
+  method: "POST",
+  headers: { Authorization: `Bearer ${accessToken}` },
+});
+const { ticket } = await res.json(); // { "ticket": "…", "expires_in": 60 }
+const ws = new WebSocket(`wss://api.example.com/api/voice/listen/${callSid}?token=${ticket}`);
 ```
+
+Non-browser clients may instead send `Authorization: Bearer <access token>`
+on the upgrade request. An API key is refused with 403: listening in needs a
+signed-in session.

@@ -147,11 +147,10 @@ def _migration_lock(db_path: Path) -> Iterator[None]:
     one volume, so a first deploy hits exactly this.
 
     A lock file next to the database serialises them. It is advisory and local
-    to one host, which matches SQLite. Postgres needs none: its DDL *is*
-    transactional, so a concurrent upgrade either waits on the
-    `pincer_alembic_version` row or rolls back whole. Nor does a database with
-    no file to share — an
-    in-memory one is private to the process that opened it.
+    to one host, which matches SQLite. Postgres is serialised by an advisory
+    lock that `env.py` holds for the whole upgrade instead. A database with no
+    file to share needs neither — an in-memory one is private to the process
+    that opened it.
     """
     database = _database_file(get_sync_url(db_path))
     try:
@@ -277,6 +276,11 @@ def _create_engine(url: str) -> AsyncEngine:
         return engine
     # A pooled Postgres connection can be dropped server-side while idle.
     target, connect_args = _asyncpg_connect_args(url)
+    # The timestamp columns are `TIMESTAMP` without a zone, and their
+    # `CURRENT_TIMESTAMP` defaults are converted to the session's zone on
+    # store: pinned to UTC, which is what `IsoText` reads them back as.
+    # asyncpg merges this with any `server_settings` the DSN carries.
+    connect_args["server_settings"] = {"timezone": "UTC"}
     return create_async_engine(target, pool_pre_ping=True, connect_args=connect_args)
 
 

@@ -7,7 +7,197 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+#### BREAKING: per-identity API authentication replaces the shared tokens (#228)
+
+The REST API and the dashboard now authenticate **identities** instead of two
+shared secrets. `PINCER_DASHBOARD_TOKEN` and `PINCER_WEB_CHAT_TOKEN` are
+removed: either one used to open every route, and with neither set the API was
+silently open.
+
+> **Breaking — action required after upgrading.** Nobody can use the API or
+> the dashboard until an identity has a password or an API key. Leftover
+> `PINCER_DASHBOARD_TOKEN` / `PINCER_WEB_CHAT_TOKEN` values are ignored.
+>
+> 1. Upgrade. Migrations `0021` and `0022` are applied at startup (or with `pincer db upgrade`).
+> 2. Create a sign-in for each dashboard user:
+>    `pincer identity create alice --email alice@example.com` (prompts for
+>    the password). An identity that already exists gets one with
+>    `pincer identity set-password <name>`.
+> 3. For the web chat widget and other headless clients, generate an API key
+>    with `pincer identity api-key <name>`, or make a key-only identity with
+>    `pincer identity create <name> --api-key` (printed once either way), and
+>    send it as `Authorization: Bearer pnc_…` in place of the old token.
+> 4. In production set `PINCER_JWT_SECRET` (32+ characters:
+>    `python -c 'import secrets; print(secrets.token_urlsafe(48))'`).
+> 5. Remove `PINCER_DASHBOARD_TOKEN` and `PINCER_WEB_CHAT_TOKEN` from the
+>    environment, then run `pincer doctor` — it flags leftovers and warns
+>    while no identity can sign in.
+> 6. If you relied on the API being open with no token (local development,
+>    tests), set `PINCER_AUTH_DISABLED=true`. Never in production.
+
+- **Sign-in** — an identity signs in with its name or email and a password and
+  receives JWTs (`POST /api/auth/login`, `POST /api/auth/refresh`); headless
+  consumers use a per-identity API key. Any identity with a password or a key
+  has full API access — there are no roles. All other `/api/*` routes take
+  `Authorization: Bearer <access token or API key>`. Reference:
+  [`docs/reference/rest-api.md`](docs/reference/rest-api.md#authentication).
+- **Credentials** — passwords are hashed with Argon2id (8–256 characters);
+  changing one invalidates every JWT issued before it (API keys are
+  unaffected). API keys have the form `pnc_…`, are stored only as a SHA-256
+  hash, are shown in full only when generated, and are replaced only with
+  `force`, which stops the old key immediately. Stored in the new table
+  `pincer_identity_credentials` (migration `0021`).
+- **Sessions** — each sign-in is a server-side session
+  (`pincer_auth_sessions`, migration `0022`). A refresh token is single-use:
+  refreshing replaces it, and presenting one that was already replaced ends
+  the session. For 30 seconds after a refresh the replaced token is still
+  answered — with the pair's current refresh token, not a further rotation —
+  so two tabs refreshing at once both stay signed in.
+  `POST /api/auth/logout` ends the caller's session on the server, so its
+  tokens are dead rather than merely forgotten by the browser.
+- **New settings** — `PINCER_JWT_SECRET` (HS256 signing secret, at least 32
+  characters or startup is refused; if unset, one is generated once into
+  `<data_dir>/jwt_secret`, mode 0600 — set it explicitly with several replicas
+  or a non-persistent data dir), `PINCER_JWT_ACCESS_TTL_SECONDS` (default
+  1800), `PINCER_JWT_REFRESH_TTL_SECONDS` (default 604800) and
+  `PINCER_AUTH_DISABLED` (default false; serves `/api/*` without
+  authentication for local development and tests, replacing the old implicit
+  "open when no token is set"). `PINCER_AUTH_MAX_FAILURES` /
+  `PINCER_AUTH_LOCKOUT_SECONDS` still apply per IP, and now also per account
+  (one budget per identity, whether it is named by id or by email; the
+  per-account lockout is one flat window, it does not double)
+  on login. Logins that arrive together share that budget: the ones beyond
+  it get 429 instead of a password check.
+- **CLI** — new `pincer identity` group: `list`, `create <name> [password]
+  [--api-key] [--email] [--display-name]` (creates the identity with its
+  password, prompted for when omitted, or with an API key),
+  `set-password <name> [password]` (resets a forgotten password and signs the
+  identity out everywhere), `api-key <name> [--force]` and `revoke <name>`.
+- **Endpoints** — `GET /api/identity/me`, `PUT /api/identity/me/password`,
+  `GET`/`POST /api/identity/me/api-key` and
+  `POST /api/voice/listen/{call_sid}/ticket`. The password, key-generation and
+  ticket routes need a session (JWT); API-key callers get 403 there. Auth
+  errors are `{"error": "<code>", "detail": "…"}` with `invalid_credentials`,
+  `invalid_token`, `token_expired` (does not count toward the IP lockout) and
+  `locked_out` (429 + `Retry-After`). `GET /api/health` also returns
+  `auth_required`.
+- **Listen-in WebSocket** — `/api/voice/listen/{call_sid}` no longer accepts a
+  shared token in `?token=`. Browsers request a ticket first (valid 60 s,
+  bound to that call, good for one connection, and dead once the session that
+  requested it signs out) and connect with `?token=<ticket>`; non-browser
+  clients may send a session access token in the `Authorization` header on
+  the upgrade. An API key cannot listen in (403). Listen sessions are audited
+  under the real identity.
+- **Chat routes** (`/api/chat/*`) — with a session JWT the user is the
+  signed-in identity and `X-Pincer-User` is ignored; with an API key,
+  `X-Pincer-User` stays the visitor-session id and becomes optional (without
+  it the key's own identity is used); with auth disabled it is required as
+  before.
+- **Doctor** — warns when no identity can sign in or when
+  there are leftover shared-token variables, and with
+  `--production` reports `PINCER_AUTH_DISABLED` as CRITICAL and an unset
+  `PINCER_JWT_SECRET` as a warning.
+- **Dashboard** — login is Agent URL + name or email + password; the access
+  token is refreshed silently. New Account page to change the password and to
+  generate or regenerate the API key (shown once). Refresh tokens are kept in
+  the browser's `localStorage`.
+- **Identity map interaction** — when an identity map (`PINCER_IDENTITY_MAP`
+  or `[identity]` in `pincer.toml`) is configured, startup pruning still
+  deletes identities that have no channel link — except those that hold a
+  password or an API key, so a dashboard-only or service identity survives
+  restarts. Removing someone from the map therefore does **not** revoke their
+  API access; `pincer identity revoke <name>` does (password, API key and
+  sessions).
+
 ### Added
+
+#### Remote skill roots: S3, Azure Blob Storage and Google Cloud Storage
+
+`PINCER_SKILLS_DIR` now also accepts `s3://bucket/prefix`, `az://container/prefix`
+or `gs://bucket/prefix`, so teams can share skills from object storage instead of
+mounting a directory. Install the new `remote-skills` extra
+(`pip install "pincer-agent[remote-skills]"`, built on cloudpathlib). See
+[Skills Guide → Remote Skill Roots](docs/guides/skills-guide.md#remote-skill-roots).
+
+- Discovery, `load_skill`, `load_skill_reference` and the dashboard's `/api/skills`
+  work unchanged on remote roots; blocking storage I/O runs off the event loop.
+- Remote files are cached only by cloudpathlib, under `skills_cache_dir/objects/`
+  (default `<data_dir>/cache/skills`; always a local directory, a URI is
+  rejected at startup); each read checks the bucket for a newer
+  object. `run_skill_script` brings a remote skill's cached folder up to date,
+  then runs it from there through the usual approval gate and sandbox, so
+  script-only edits take effect on the next run.
+- Credentials: optional `PINCER_STORAGE_S3_*`, `PINCER_STORAGE_AZURE_*` and
+  `PINCER_STORAGE_GCS_*` settings; unset ones fall back to each SDK's default chain.
+- A remote `skills_dir` must be usable at startup. `pincer run`, `pincer run tasks`,
+  `pincer mcp serve` and `pincer skills rebuild` exit 1 if the extra is missing,
+  the storage client can't be built, or listing the root fails (credentials,
+  bucket, endpoint). The error names the `PINCER_STORAGE_*` settings to
+  configure. SDK default credentials count as configured (for Azure, via
+  `DefaultAzureCredential` once `storage_azure_account_url` is set).
+- An outage after startup never empties the index. Rescans keep the unreachable
+  root's previous skills and announce nothing; `pincer skills rebuild` and
+  `POST /api/skills/rebuild` fail (exit 1, or HTTP 503) and change nothing.
+- The `remote-skills` extra requires cloudpathlib >= 0.25 (whose cache refuses
+  object keys that would land outside it) and adds `azure-identity`.
+- New `pincer skills rebuild [--keep-cache]`: clears cached remote files, rescans
+  and announces the change through a generation stamp in `skills_cache_dir`. A
+  running `pincer run` reloads without a restart: a background watcher checks the
+  stamp every `skills_index_watch_interval_seconds` (default 300; `0` disables it)
+  and rescans off the request path, and the dashboard checks it on every request.
+- New `POST /api/skills/rebuild[?keep_cache=true]`: rebuilds the serving process's
+  index, then queues a `rebuild_skill_index` background job with the new
+  generation for the task workers (consumed by one process; idempotent). Returns
+  the rebuilt skill list and whether the job was queued.
+- One skill index per process, owned by `pincer.services.skills.SkillService` and
+  shared by the agent, its skill tools, the dashboard API and the CLI.
+- `/api/skills` rescans when its index is older than `skills_index_cache_ttl_seconds`
+  (default 60, maximum 60, `0` = every request), and immediately after any index
+  change in any process.
+- `pincer doctor` checks that a remote root is reachable.
+
+### Fixed
+
+- `pincer doctor` and `GET /api/doctor` now check the configured `skills_dir`;
+  they always looked at `~/.pincer/skills` before.
+
+### Added
+
+#### Daemon mode: `pincer run -d`, `logs`, `status`, `stop`, `restart`
+
+Pincer can run in the background without `nohup` or Docker, scoped to its data
+directory. See [CLI Reference → Background mode](docs/reference/cli.md#background-mode-daemon).
+
+- **`pincer run -d`** starts Pincer in its own session (it outlives the terminal),
+  from the caller's working directory and environment, so it loads the same `.env`.
+  It shows the startup log and returns once every channel is up:
+  `Pincer started (pid 4182) — channels: telegram, signal  'pincer logs -f' to follow`.
+  A crash before that prints the last 20 log lines and exits 1. A start slower than
+  `--wait-timeout` (default 60 s) exits 1 and leaves Pincer starting. A second
+  `run -d` reports the running one and exits 0. While a foreground Pincer holds the
+  port, `run -d` refuses.
+- **`pincer logs`** prints `<data_dir>/logs/pincer.log` raw, so it pipes cleanly.
+  `-n/--tail N` limits it to the last N lines. `-f` follows from the last 50 and
+  ends by itself once Pincer has exited. Each start rotates the previous log to
+  `pincer.log.1` and keeps 5 previous sessions. When Pincer isn't running, `logs`
+  shows the last session's log.
+- **`pincer status`** prints one line: running, starting or not running, with
+  the pid, uptime, port, channels, version and the directory the daemon was started
+  from.
+- **`pincer stop`** shuts Pincer down the same graceful way as Ctrl+C (calls drain
+  with their spoken ending). It waits up to `--timeout` (default 90 s, sized to the
+  60 s call drain) and never kills on its own. `--force` kills it.
+- **`pincer restart`** stops it with the same rules, then starts a new one from
+  the current directory and environment. It doesn't start a new one while the old
+  one is still shutting down. It has no `--force`.
+- **Plain `pincer run` while a daemon is up attaches** to it: it follows the log
+  instead of starting a second instance. Ctrl+C stops the daemon gracefully. A
+  second Ctrl+C, or closing the terminal, only detaches.
+- Not supported on Windows (use a service manager) or inside a container (use
+  `docker compose up -d`). `pincer run tasks -d` is refused, because the task worker
+  runs in the foreground.
 
 #### Telephony telemetry and the internal Telephony dashboard
 
@@ -148,6 +338,14 @@ retried callbacks.
 
 ### Fixed
 
+- **SIGTERM (`docker stop`, `pincer stop`) now finishes the graceful shutdown.**
+  uvicorn re-raised the signal when the API server exited. That cancelled the
+  shutdown at the trigger manager, so channels never drained their calls.
+- **`pincer run tasks` shuts down gracefully on SIGTERM**, the same way as on
+  Ctrl+C. Before, it was killed at once.
+- The "port already in use" error no longer suggests `pkill -f 'pincer run'`,
+  which also killed task workers. It points to `pincer stop` or the foreground
+  terminal instead.
 - **Turn telemetry and per-call rows could be written out of order.** Background
   call-row writes are now chained per call, so a late "answered" write can no
   longer resurrect a stale status on a call that has already ended, and a turn's
@@ -161,6 +359,56 @@ retried callbacks.
   `tsconfig.app.json`, and the four pre-existing TypeScript parameter properties
   this exposed (in `lib/listenIn*`, rejected by `erasableSyntaxOnly`) are
   rewritten as explicit fields — `pnpm build` succeeds again.
+- **Outbound calls clung to their purpose when the callee changed the subject.**
+  The call brief (`CALL_BRIEF`, en/de/uk) now frames the purpose as the call's
+  reason and goal rather than a binding task: the agent still opens with it, but
+  engages with whatever the callee raises and returns to the goal when there is
+  an opening; a callee who doesn't want to deal with it now gets a follow-up, not
+  insistence. Dropped: "never offer unrelated help", "end politely if the task
+  can't be done", and "anything not covered → check with the owner". The persona
+  loses its "for a specific task" line, and the first in-call tool rule allows
+  read-only lookups that serve the conversation (writes still serve only the
+  owner; the gate enforces that regardless of wording).
+- **Outbound calls spent their whole life in the inbound `INTENT_CAPTURE` phase.**
+  Once the callee speaks an outbound call moves to `FREEFORM`, whose instruction
+  is now conversation-first. `FREEFORM` keeps the same 120 s silence budget, and
+  its timeout line says nothing was heard instead of "we've been on a while".
+  Phase instructions no longer leak internal state names (`VERIFY`/`FREEFORM`).
+- **Repeated calls to the same number replayed earlier calls.** The voice LLM
+  session is now keyed per call (`voice:<call_sid>`) on both the streaming turn
+  and the blocking guard-regeneration path, so concurrent calls with one party
+  never share or clear each other's history; cross-call memory stays in the
+  thread context block.
+- `voice_max_response_tokens` default raised from 150 to 220 — a conversational
+  German reply needs the room. Removed the unused `voice/outbound_prompts.py` and
+  `VOICE_GREETING_OUTBOUND`.
+- **The `sqlite_vec_memory` embedding model now really is cached where the
+  config says.** `pincer.toml` and the `sqlite-vec-memory-mcp` image set
+  `FASTEMBED__CACHE_DIR` / `FASTEMBED_CACHE_DIR`, which fastembed ignores, so
+  the model was kept in `$TMPDIR/fastembed_cache` instead. They now set
+  `FASTEMBED_CACHE_PATH`. **On upgrade, stdio and host installs (the server
+  started from `pincer.toml`) download the model once more** (about 65 MB)
+  into `${PINCER_DATA_DIR}/fastembed_cache`. A host with no network access has
+  no memory embedding until the model is there: copy the `models--…`
+  directory from the old `$TMPDIR/fastembed_cache` into
+  `${PINCER_DATA_DIR}/fastembed_cache` before starting. The
+  `sqlite-vec-memory-mcp` image needs nothing: the model is built into it.
+- **Pincer no longer takes another application's `alembic_version`.** The
+  upgrade renamed any `alembic_version` it found to `pincer_alembic_version`,
+  so in a database shared with another Alembic application it took that
+  application's history and read its revision as Pincer's. It now renames only
+  its own (one of Pincer's revisions, beside Pincer's tables) and builds
+  `pincer_alembic_version` beside anyone else's. **An unknown revision beside
+  Pincer's tables now stops the upgrade** with an error instead of replaying
+  every revision over the schema: run the Pincer version that has that
+  revision (a fork or feature branch), or, if the table belongs to another
+  application, give Pincer its own database or schema.
+- **Two Pincer processes starting together on Postgres no longer fail the
+  second one's migration.** `pincer` and `pincer-tasks` both upgrade at start;
+  the second now waits on an advisory lock held for the whole upgrade (logging
+  that it is waiting), then finds the database current. The lock is held in a
+  transaction on a second connection for as long as the upgrade runs, so a
+  pooler or `idle_in_transaction_session_timeout` must allow that.
 
 ### Added
 

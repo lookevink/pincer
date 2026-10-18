@@ -12,6 +12,7 @@ Flow:
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 from collections.abc import Awaitable, Callable
@@ -60,8 +61,8 @@ if TYPE_CHECKING:
     from pincer.mcp.server import PincerMCPServer
     from pincer.memory.base import BaseMemoryBackend
     from pincer.memory.summarizer import Summarizer
+    from pincer.services.skills import SkillService
     from pincer.tools.registry import ToolRegistry
-    from pincer.tools.skills.index import SkillIndex
 
 logger = logging.getLogger(__name__)
 
@@ -277,6 +278,32 @@ def _sanitize_tool_pairs(messages: list[LLMMessage]) -> list[LLMMessage]:
     return clean
 
 
+class _OutageLog:
+    """Logs a dependency that fails on every message once per outage, not once per message.
+
+    The first failure is a WARNING with its traceback; repeats are DEBUG until
+    a call succeeds, which is logged at INFO. Call `failed()` from inside the
+    `except` block, so the traceback is the current exception's.
+    """
+
+    def __init__(self, failure: str, recovery: str) -> None:
+        self._failure = failure
+        self._recovery = recovery
+        self._down = False
+
+    def failed(self) -> None:
+        if self._down:
+            logger.debug(self._failure, exc_info=True)
+            return
+        self._down = True
+        logger.warning(self._failure, exc_info=True)
+
+    def succeeded(self) -> None:
+        if self._down:
+            self._down = False
+            logger.info(self._recovery)
+
+
 class Agent:
     """The core Pincer agent."""
 
@@ -303,7 +330,7 @@ class Agent:
         self._tool_event_callback = tool_event_callback
         self.mcp_manager: MCPClientManager | None = None  # set by cli after startup
         self.mcp_server: PincerMCPServer | None = None  # set by cli after startup
-        self.skill_index: SkillIndex | None = None  # set by cli after startup
+        self.skill_service: SkillService | None = None  # set by cli after startup
         # set by cli after startup; supplies each user's own timezone so the
         # clock in the system prompt reads in *their* zone, not the server's
         self.identity_resolver: Any = None
@@ -312,6 +339,12 @@ class Agent:
         self._last_active: tuple[str, str] | None = None
         # Injected by cli.py: (user_id, channel_name, question) -> answer
         self._ask_user_callback: Callable[[str, str, str], Awaitable[str]] | None = None
+        self._mcp_list_outage = _OutageLog(
+            "Failed to fetch MCP server list for prompt", "Fetching the MCP server list for prompt recovered"
+        )
+        self._memory_outage = _OutageLog(
+            "Failed to fetch memories for prompt", "Fetching memories for prompt recovered"
+        )
 
     @property
     def tool_registry(self) -> ToolRegistry:
@@ -342,6 +375,7 @@ class Agent:
         channel_user_id: str | None = None,
         channel_name: str | None = None,
         extra_system: str | None = None,
+        session_key: str | None = None,
     ) -> AgentResponse:
         """
         Main entry point: process a user message and return agent's response.
@@ -366,13 +400,20 @@ class Agent:
                 from the session key.  Defaults to ``channel`` when omitted.
             extra_system: Channel-supplied system-prompt addition for this turn
                 (e.g. voice live-call rules in the call language).
+            session_key: Exact session key, overriding ``channel:user_id``
+                (voice: one session per call, see ``stream_voice_turn``).
         """
         self._last_active = (user_id, channel_name or channel)
-        session = await self._sessions.get_or_create(user_id, channel)
+        session = await self._sessions.get_or_create(user_id, channel, session_key=session_key)
 
         # Snapshot onboarding state BEFORE the user message is appended.
-        was_fresh = session.is_fresh()
-        awaiting_onboarding_reply = session.onboarding_prompt_already_sent() and not session.is_onboarded()
+        # Nobody onboards mid-phone-call — and with a session per call, every
+        # call's first blocking turn would otherwise look like a fresh user.
+        onboarding = (channel_name or channel) != "voice"
+        was_fresh = onboarding and session.is_fresh()
+        awaiting_onboarding_reply = (
+            onboarding and session.onboarding_prompt_already_sent() and not session.is_onboarded()
+        )
 
         # Build user message
         img_contents: list[ImageContent] = []
@@ -879,6 +920,10 @@ class Agent:
 
         yield StreamChunk(StreamEventType.DONE, full_text)
 
+    async def end_voice_session(self, session_key: str) -> None:
+        """Drop a finished call's session from the cache (see ``stream_voice_turn``)."""
+        await self._sessions.evict(session_key)
+
     async def stream_voice_turn(
         self,
         user_id: str,
@@ -888,6 +933,7 @@ class Agent:
         extra_system: str | None = None,
         channel_user_id: str | None = None,
         timings: dict[str, Any] | None = None,
+        session_key: str | None = None,
     ) -> AsyncIterator[StreamChunk]:
         """One live phone-call turn, streamed (Sprint 5, T5.2).
 
@@ -898,9 +944,14 @@ class Agent:
           language policy, phase instruction, appointment block);
         - tools filtered to the voice-compatible set (smaller schemas, no
           shell/file tools mid-call);
-        - short outputs: ``voice_max_response_tokens`` (default 150) and an
+        - short outputs: ``voice_max_response_tokens`` (default 220) and an
           optional fast ``voice_turn_model``;
         - no onboarding flow (nobody onboards mid-phone-call).
+
+        ``session_key`` is the call's own session (the voice channel passes
+        one per call). A session keyed by the other party's number would be
+        shared by concurrent calls and replay earlier calls' turns; cross-call
+        continuity is the thread context block's job (voice/threads.py).
 
         Yields TEXT deltas, TOOL_START/TOOL_DONE around tool execution, and a
         final DONE carrying the full turn text. LLM errors propagate so the
@@ -912,7 +963,7 @@ class Agent:
 
         turn_started = time.monotonic()
         self._last_active = (user_id, channel)
-        session = await self._sessions.get_or_create(user_id, channel)
+        session = await self._sessions.get_or_create(user_id, channel, session_key=session_key)
         user_msg = LLMMessage(role=MessageRole.USER, content=text)
         await self._sessions.add_message(session, user_msg)
         # NOTE: no summarizer here — it is an LLM call on the voice critical
@@ -933,7 +984,7 @@ class Agent:
             tool_schemas = call_gate.filter_schemas(self._tools.get_schemas()) or None
         else:
             tool_schemas = filter_voice_tools(self._tools.get_schemas())
-        max_tokens = int(getattr(self._settings, "voice_max_response_tokens", 150) or 150)
+        max_tokens = int(getattr(self._settings, "voice_max_response_tokens", 220) or 220)
 
         # Voice turn model (Sprint 5 T5.4): "" = default provider+model;
         # "claude-..." = default provider, that model; "openai:gpt-5-mini" =
@@ -1160,8 +1211,10 @@ class Agent:
             base_prompt += "\n" + _GOOGLE_TOOL_CHAIN_HINTS
 
         # Inject available skills (progressive disclosure level 1)
-        if self.skill_index:
-            skills_block = self.skill_index.render_prompt_block(max_tokens=self._settings.skills_max_prompt_tokens)
+        if self.skill_service:
+            # Picks up a rebuild announced by another process (one local file read otherwise).
+            skill_index = await asyncio.to_thread(self.skill_service.ensure_current)
+            skills_block = skill_index.render_prompt_block(max_tokens=self._settings.skills_max_prompt_tokens)
             if skills_block:
                 base_prompt += (
                     "\n\n[Available Skills — call load_skill(name) to read one before using its scripts]\n"
@@ -1187,8 +1240,9 @@ class Agent:
                     base_prompt += "\n\n[Connected MCP servers — use their prefixed tools when relevant]\n" + "\n".join(
                         server_lines
                     )
+                self._mcp_list_outage.succeeded()
             except Exception:
-                logger.debug("Failed to fetch MCP server list for prompt", exc_info=True)
+                self._mcp_list_outage.failed()
 
         # The model has no clock and will invent today's date if nothing states
         # it (see core/clock.py). Appended on every return path below, and last
@@ -1207,15 +1261,14 @@ class Agent:
 
         try:
             memories = await self._memory.search_text(user_text, user_id=user_id, limit=3)
-            if not memories:
-                return _with_extra(base_prompt)
-
-            memory_lines = [f"- {m.content}" for m in memories]
-            memory_block = "\n".join(memory_lines)
-            return _with_extra(f"{base_prompt}\n\n[Relevant memories about this user]\n{memory_block}")
+            memory_block = "\n".join(f"- {m.content}" for m in memories)
         except Exception:
-            logger.debug("Failed to fetch memories for prompt", exc_info=True)
+            self._memory_outage.failed()
             return _with_extra(base_prompt)
+        self._memory_outage.succeeded()
+        if not memories:
+            return _with_extra(base_prompt)
+        return _with_extra(f"{base_prompt}\n\n[Relevant memories about this user]\n{memory_block}")
 
     async def _ingest_onboarding_reply(
         self,
